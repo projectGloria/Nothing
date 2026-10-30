@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
-use windows_sys::Win32::System::Registry::{RegDeleteKeyValueW, RegSetKeyValueW, HKEY_LOCAL_MACHINE, REG_SZ};
+use windows_sys::Win32::System::Registry::{RegDeleteKeyValueW, RegDeleteTreeW, RegSetKeyValueW, HKEY_LOCAL_MACHINE, REG_DWORD, REG_SZ};
 use windows_sys::Win32::System::Services::{
     ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW,
     QueryServiceStatus, StartServiceW, SC_ACTION, SC_ACTION_RESTART, SC_HANDLE, SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SERVICE_ALL_ACCESS,
@@ -22,6 +22,48 @@ use crate::util::wide;
 
 pub const SERVICE_NAME: &str = "NothingIndex";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+/// Makes Nothing show up (and uninstallable) in Settings > Apps > Installed apps.
+const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Nothing";
+
+fn reg_sz(key: &str, name: &str, value: &str) {
+    let v = wide(value);
+    unsafe { RegSetKeyValueW(HKEY_LOCAL_MACHINE, wide(key).as_ptr(), wide(name).as_ptr(), REG_SZ, v.as_ptr() as *const _, (v.len() * 2) as u32) };
+}
+
+fn reg_dword(key: &str, name: &str, value: u32) {
+    unsafe { RegSetKeyValueW(HKEY_LOCAL_MACHINE, wide(key).as_ptr(), wide(name).as_ptr(), REG_DWORD, &value as *const u32 as *const _, 4) };
+}
+
+/// Close every other running nothing.exe: an older UI sitting in the tray holds its exe
+/// open and would keep running the old version.
+fn stop_other_uis() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let args: Vec<String> = std::env::args().collect();
+    let keep = args.iter().position(|a| a == "--keep-pid").and_then(|i| args.get(i + 1)).and_then(|p| p.parse::<u32>().ok());
+    let mut cmd = std::process::Command::new("taskkill");
+    cmd.args(["/F", "/IM", "nothing.exe", "/FI", &format!("PID ne {}", std::process::id())]);
+    if let Some(k) = keep {
+        cmd.args(["/FI", &format!("PID ne {k}")]);
+    }
+    let _ = cmd.creation_flags(CREATE_NO_WINDOW).output();
+}
+
+fn register_uninstaller(dst: &Path) {
+    let exe = dst.join("nothing.exe");
+    let k = UNINSTALL_KEY;
+    reg_sz(k, "DisplayName", "Nothing");
+    reg_sz(k, "DisplayVersion", env!("CARGO_PKG_VERSION"));
+    reg_sz(k, "Publisher", "projectGloria");
+    reg_sz(k, "DisplayIcon", &format!("{},0", exe.display()));
+    reg_sz(k, "InstallLocation", &dst.display().to_string());
+    reg_sz(k, "UninstallString", &format!("\"{}\" --uninstall", exe.display()));
+    reg_sz(k, "URLInfoAbout", "https://github.com/projectGloria/Nothing");
+    reg_dword(k, "NoModify", 1);
+    reg_dword(k, "NoRepair", 1);
+    let bytes: u64 = ["nothing.exe", "nothing-svc.exe"].iter().filter_map(|f| std::fs::metadata(dst.join(f)).ok()).map(|m| m.len()).sum();
+    reg_dword(k, "EstimatedSize", (bytes / 1024) as u32);
+}
 
 pub fn install_dir() -> PathBuf {
     let pf = std::env::var_os("ProgramW6432").or_else(|| std::env::var_os("ProgramFiles")).map(PathBuf::from).unwrap_or_else(|| r"C:\Program Files".into());
@@ -45,7 +87,9 @@ pub fn is_elevated() -> bool {
 /// Re-run this exe elevated with `arg` (UAC prompt) and wait. Returns the exit code.
 pub fn elevate_and_wait(arg: &str) -> Option<u32> {
     let exe = std::env::current_exe().ok()?;
-    let (verb, file, params) = (wide("runas"), wide(&exe.display().to_string()), wide(arg));
+    // --keep-pid: the elevated child must not close us (we wait for it, then hand over).
+    let params = format!("{arg} --keep-pid {}", std::process::id());
+    let (verb, file, params) = (wide("runas"), wide(&exe.display().to_string()), wide(&params));
     unsafe {
         let mut sei: SHELLEXECUTEINFOW = std::mem::zeroed();
         sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
@@ -125,6 +169,7 @@ pub fn install() -> i32 {
         return 2;
     }
     let dst = install_dir();
+    stop_other_uis();
     if let Err(e) = std::fs::create_dir_all(&dst) {
         crate::app::message("Install", &format!("Cannot create {}: {e}", dst.display()), true);
         return 3;
@@ -204,10 +249,9 @@ pub fn install() -> i32 {
         };
         ChangeServiceConfig2W(svc.0, SERVICE_CONFIG_FAILURE_ACTIONS, &fa as *const _ as *const _);
         StartServiceW(svc.0, 0, std::ptr::null());
-
-        let run = wide(&format!("\"{}\" --startup", dst.join("nothing.exe").display()));
-        RegSetKeyValueW(HKEY_LOCAL_MACHINE, wide(RUN_KEY).as_ptr(), wide("Nothing").as_ptr(), REG_SZ, run.as_ptr() as *const _, (run.len() * 2) as u32);
     }
+    reg_sz(RUN_KEY, "Nothing", &format!("\"{}\" --startup", dst.join("nothing.exe").display()));
+    register_uninstaller(&dst);
     0
 }
 
@@ -217,7 +261,11 @@ pub fn uninstall() -> i32 {
         stop_and_wait(&s);
         unsafe { DeleteService(s.0) };
     }
-    unsafe { RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, wide(RUN_KEY).as_ptr(), wide("Nothing").as_ptr()) };
+    stop_other_uis();
+    unsafe {
+        RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, wide(RUN_KEY).as_ptr(), wide("Nothing").as_ptr());
+        RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(UNINSTALL_KEY).as_ptr());
+    }
     if let Some(pd) = std::env::var_os("ProgramData") {
         let _ = std::fs::remove_dir_all(PathBuf::from(pd).join("Nothing"));
     }

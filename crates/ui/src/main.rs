@@ -50,6 +50,10 @@ fn main() {
                     let _ = std::process::Command::new(install::install_dir().join("nothing.exe")).spawn();
                     0
                 }
+                Some(0) => {
+                    app::message("Nothing", "Nothing has been removed. Files still in use are deleted at the next restart.", false);
+                    0
+                }
                 Some(c) => c as i32,
                 None => 1,
             }

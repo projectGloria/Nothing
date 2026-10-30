@@ -89,6 +89,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nothing-setup"
+version = "0.1.0"
+dependencies = [
+ "embed-resource",
+ "windows-sys",
+]
+
+[[package]]
 name = "nothing-svc"
 version = "0.1.0"
 dependencies = [

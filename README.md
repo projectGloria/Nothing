@@ -17,14 +17,22 @@ Measured on the author's machine (Windows 11, Crucial P3 NVMe, 16 threads, C: = 
 
 ## Install
 
+Run **`nothing-setup.exe`**: a single 1.6 MB file with both binaries inside. Use
+`nothing-setup.exe /S` for a silent install. Build it with:
+
 ```
-nothing.exe --install
+build-installer.cmd        → target\release\nothing-setup.exe
 ```
 
-This asks for elevation once. It copies both exes to `C:\Program Files\Nothing`, registers
-the **Nothing Index** service (LocalSystem, auto-start), starts it, and adds the UI to
-startup (tray, hidden). You can also run it from the UI: **Tools ▸ Install / Repair
-Indexing Service**. To remove everything: **Tools ▸ Uninstall** or `nothing.exe --uninstall`.
+Setup asks for elevation once. It copies both exes to `C:\Program Files\Nothing`,
+registers the **Nothing Index** service (LocalSystem, auto-start, restarts on failure),
+starts it, adds the UI to startup (tray, hidden), and registers Nothing in **Settings ▸
+Apps ▸ Installed apps**. Running a newer setup over an existing install updates it in place
+and keeps the index and settings.
+
+Without the setup you can also run `nothing.exe --install` next to `nothing-svc.exe`, or
+use **Tools ▸ Install / Repair Indexing Service**. To remove everything, uninstall it from
+Settings ▸ Apps, or use **Tools ▸ Uninstall** or `nothing.exe --uninstall`.
 
 Press **Win+Alt+Space** anywhere to summon the window. Closing the window hides it to the
 tray, so the next summon is instant.

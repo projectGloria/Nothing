@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/svc", "crates/ui"]
+members = ["crates/core", "crates/svc", "crates/ui", "crates/setup"]
+# The installer embeds the release exes of `nothing` and `nothing-svc`, so it is built in a
+# second step (see build-installer.cmd), not by a plain `cargo build`.
+default-members = ["crates/core", "crates/svc", "crates/ui"]
 
 [workspace.package]
 version = "0.1.0"
