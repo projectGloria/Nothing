@@ -182,12 +182,13 @@ impl Engine {
                         }
                         self.set_progress(letter, None);
                         log!(
-                            "scanned {}: {} entries from {} MFT records ({} MB) in {} ms",
+                            "scanned {}: {} entries from {} MFT records ({} MB) in {} ms ({})",
                             letter as char,
                             n,
                             st.records,
                             st.mft_bytes >> 20,
-                            st.millis
+                            st.millis,
+                            st.phases
                         );
                         self.dirty.store(true, Relaxed);
                         self.save();

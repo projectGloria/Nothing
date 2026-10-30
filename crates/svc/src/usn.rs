@@ -169,7 +169,7 @@ pub fn decode(mut b: &[u8]) -> Vec<Change> {
             _ => continue,
         };
         let Some(nb) = r.get(no..no + nl) else { continue };
-        let name = String::from_utf16_lossy(&nb.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>());
+        let name = String::from_utf16_lossy(&nb.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>());
         let (rec, parent) = (frn & MASK48, parent & MASK48);
         out.push(if reason & R_DELETE != 0 {
             Change::Delete { rec }

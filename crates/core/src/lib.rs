@@ -2,6 +2,10 @@
 //! format and the UI <-> service wire protocol. No Win32 in here, so it is unit-testable
 //! and the UI binary links only the protocol bits it uses (LTO drops the rest).
 
+// Struct-of-arrays code indexes several parallel arrays by the same id; iterator
+// chains would hide that, not clarify it.
+#![allow(clippy::needless_range_loop, clippy::large_enum_variant)]
+
 pub mod fold;
 pub mod index;
 pub mod persist;

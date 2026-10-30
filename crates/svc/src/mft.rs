@@ -33,7 +33,7 @@ const A_DIR: u32 = 0x4000_0000;
 const FILE_ATTRIBUTE_HIDDEN: u32 = 2;
 const FILE_ATTRIBUTE_SYSTEM: u32 = 4;
 
-const CHUNK: usize = 4 << 20;
+const CHUNK: usize = 2 << 20;
 
 pub fn open_volume(letter: u8, overlapped: bool) -> io::Result<Handle> {
     let path = wide(&format!(r"\\.\{}:", letter as char));
@@ -289,6 +289,7 @@ fn mft_extents(letter: u8, vol: HANDLE, vd: &NTFS_VOLUME_DATA_BUFFER) -> io::Res
 }
 
 pub struct ScanStats {
+    pub phases: String,
     pub records: u64,
     pub mft_bytes: u64,
     pub millis: u128,
@@ -309,6 +310,8 @@ pub fn scan(letter: u8, serial: u32, progress: &(dyn Fn(u8) + Sync)) -> io::Resu
     let rs = vd.BytesPerFileRecordSegment as usize;
     let total_recs = (vd.MftValidDataLength as u64 / rs as u64) as usize;
     let extents = mft_extents(letter, vol.0, &vd)?;
+    let t_open = t0.elapsed();
+    let read_ns = AtomicU64::new(0);
 
     // Plan chunk reads: (disk offset, first record number, byte length).
     let mut plan = Vec::new();
@@ -344,7 +347,8 @@ pub fn scan(letter: u8, serial: u32, progress: &(dyn Fn(u8) + Sync)) -> io::Resu
         bytes: Vec<u8>,
     }
 
-    let readers = 2usize;
+    // Several reads in flight: NVMe only reaches full speed with queue depth > 1.
+    let readers = 8usize;
     let workers = nothing_core::index::threads().saturating_sub(1).max(1);
     let (tx, rx) = sync_channel::<(u64, usize, ABuf)>(workers * 2);
     let rx = Arc::new(Mutex::new(rx));
@@ -355,14 +359,17 @@ pub fn scan(letter: u8, serial: u32, progress: &(dyn Fn(u8) + Sync)) -> io::Resu
     let parts: Vec<Part> = std::thread::scope(|s| {
         for r in 0..readers {
             let tx = tx.clone();
-            let (vol, pool, read_err) = (&vol, &pool, &read_err);
+            let (vol, pool, read_err, read_ns) = (&vol, &pool, &read_err, &read_ns);
             s.spawn(move || {
                 for (i, &(off, first, len)) in plan.iter().enumerate() {
                     if i % readers != r {
                         continue;
                     }
                     let mut b = pool.lock().unwrap().pop().unwrap_or_else(|| ABuf::new(CHUNK));
-                    match read_at(vol.0, off, &mut b.slice()[..len]) {
+                    let tr = Instant::now();
+                    let res = read_at(vol.0, off, &mut b.slice()[..len]);
+                    read_ns.fetch_add(tr.elapsed().as_nanos() as u64, Relaxed);
+                    match res {
                         Ok(n) => {
                             if tx.send((first, n - n % rs, b)).is_err() {
                                 return;
@@ -412,7 +419,7 @@ pub fn scan(letter: u8, serial: u32, progress: &(dyn Fn(u8) + Sync)) -> io::Resu
                                         return;
                                     }
                                     let off = part.bytes.len();
-                                    let units = name.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]));
+                                    let units = name.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]]));
                                     let mut tmp = [0u8; 4];
                                     for ch in char::decode_utf16(units) {
                                         let ch = ch.unwrap_or('\u{FFFD}');
@@ -436,6 +443,7 @@ pub fn scan(letter: u8, serial: u32, progress: &(dyn Fn(u8) + Sync)) -> io::Resu
         return Err(e);
     }
 
+    let t_io = t0.elapsed();
     // ---- assemble ----
     let mut ix = Index::default();
     let root_name = format!("{}:", letter as char);
@@ -512,16 +520,27 @@ pub fn scan(letter: u8, serial: u32, progress: &(dyn Fn(u8) + Sync)) -> io::Resu
             state[c as usize] = verdict;
         }
     }
-    for id in 0..n {
-        if state[id] != 1 {
+    let mut pruned = 0;
+    for (id, &st) in state.iter().enumerate() {
+        if st != 1 {
             ix.delete(id as u32);
+            pruned += 1;
         }
     }
     ix.vols.push(v);
     ix.compact();
     ix.shrink();
     progress(100);
-    let stats = ScanStats { records: total_recs as u64, mft_bytes: total_recs as u64 * rs as u64, millis: t0.elapsed().as_millis() };
+    let phases = format!(
+        "open {} ms, read+parse {} ms (readers busy {} ms total), assemble {} ms; {} names, {} unreachable pruned",
+        t_open.as_millis(),
+        (t_io - t_open).as_millis(),
+        read_ns.load(Relaxed) / 1_000_000,
+        (t0.elapsed() - t_io).as_millis(),
+        n,
+        pruned
+    );
+    let stats = ScanStats { records: total_recs as u64, mft_bytes: total_recs as u64 * rs as u64, millis: t0.elapsed().as_millis(), phases };
     Ok((ix, stats))
 }
 

@@ -140,7 +140,7 @@ pub fn load(path: &Path) -> io::Result<Index> {
     if &trailer != TRAILER {
         return Err(bad("truncated"));
     }
-    validate(&ix).map_err(|m| bad(m))?;
+    validate(&ix).map_err(bad)?;
     ix.folded = fold_arena(&ix.names);
     Ok(ix)
 }

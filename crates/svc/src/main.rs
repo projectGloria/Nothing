@@ -5,6 +5,8 @@
 //!   nothing-svc --scan C: [--bench q ...]   one-shot MFT scan + stats (elevated)
 //!   nothing-svc --walk DIR [--serve] [--bench q ...]   dev: directory-walk index, unelevated
 
+#![allow(clippy::needless_range_loop)]
+
 mod engine;
 mod log;
 mod mft;
@@ -77,8 +79,12 @@ fn main() {
             e.start();
             let e2 = e.clone();
             std::thread::spawn(move || server::serve(e2));
-            unsafe { WaitForSingleObject(e.stop.0, INFINITE) };
+            // `--for SECS`: stop by itself (for scripted elevated test runs).
+            let limit = args.iter().position(|a| a == "--for").and_then(|i| args.get(i + 1)).and_then(|s| s.parse::<u32>().ok());
+            unsafe { WaitForSingleObject(e.stop.0, limit.map(|s| s * 1000).unwrap_or(INFINITE)) };
+            e.request_stop();
             e.save();
+            log!("console run finished");
         }
         Some("--scan") => {
             log::init(true);
@@ -91,6 +97,7 @@ fn main() {
                     ix.rebuild_sorts();
                     let sort_ms = t.elapsed().as_millis();
                     println!("MFT: {} records, {} MB read+parsed in {} ms", st.records, st.mft_bytes >> 20, st.millis);
+                    println!("  {}", st.phases);
                     println!("sort orders built in {sort_ms} ms");
                     report(&ix, "index", st.millis + sort_ms);
                     if !bench_qs.is_empty() {
