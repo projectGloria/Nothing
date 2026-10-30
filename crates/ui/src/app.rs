@@ -26,6 +26,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use crate::icons::Icons;
 use crate::ipc::{Cmd, Event, Ipc};
 use crate::settings::Settings;
+use crate::thumbs::{Done, Thumbs};
 use crate::util::{date, from_wide, human_bytes, join_path, loword, rgb, size_kb, thousands, wide};
 use crate::{dark, icons, install, shell};
 
@@ -34,6 +35,7 @@ pub const WM_APP_SHOW: u32 = WM_APP + 4;
 const WM_APP_IPC: u32 = WM_APP + 1;
 const WM_APP_ICON: u32 = WM_APP + 2;
 const WM_APP_TRAY: u32 = WM_APP + 3;
+const WM_APP_THUMB: u32 = WM_APP + 5;
 
 const PAGE: u32 = 100;
 const TIMER_STATUS: usize = 1;
@@ -96,6 +98,7 @@ struct RowView {
     icon: i32,
     bytes: u64,
     full: String,
+    dir: bool,
 }
 
 // Settings::theme values.
@@ -106,6 +109,8 @@ const THEME_BLACK: u8 = 3;
 
 // Settings::view values.
 const VIEW_DETAILS: u8 = 0;
+/// Large and up get real thumbnails; at 32px they'd cost far more than they show.
+const VIEW_THUMBS_FROM: u8 = 2;
 
 struct Theme {
     dark: bool,
@@ -168,6 +173,7 @@ pub struct App {
     theme: Theme,
     ipc: Ipc,
     icons: Icons,
+    thumbs: Thumbs,
     settings: Settings,
 
     gen: u32,
@@ -367,8 +373,10 @@ pub fn run(start_hidden: bool) -> i32 {
             SetWindowPos(hwnd, null_mut(), 0, 0, scale(settings.w, dpi), scale(settings.h, dpi), SWP_NOMOVE | SWP_NOZORDER);
         }
 
+        // No WS_EX_CLIENTEDGE: its themed frame is a bright box in dark mode. The parent
+        // paints the field background and hairline instead (see `paint`).
         let edit = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
+            0,
             wide("EDIT").as_ptr(),
             null(),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
@@ -418,6 +426,7 @@ pub fn run(start_hidden: bool) -> i32 {
             theme: Theme::new(THEME_LIGHT), // placeholder: apply_theme resolves the real one
             ipc: Ipc::spawn(hwnd, WM_APP_IPC),
             icons,
+            thumbs: Thumbs::new(hwnd, WM_APP_THUMB),
             settings,
             gen: 0,
             inflight: None,
@@ -507,6 +516,7 @@ impl App {
         self.gen = self.gen.wrapping_add(1);
         self.inflight = Some(self.gen);
         self.requested.clear();
+        self.thumbs.dirty = true;
         if keep {
             let old = std::mem::take(&mut self.rows);
             self.stale = old;
@@ -544,6 +554,7 @@ impl App {
             icon,
             bytes: if is_dir { 0 } else { r.size },
             full,
+            dir: is_dir,
         }
     }
 
@@ -555,6 +566,8 @@ impl App {
             self.stale.remove(&idx);
             self.rows.insert(idx, v);
         }
+        // Newly known paths may fall in the thumbnail window.
+        self.thumbs.dirty = true;
         // Mark fully covered pages as fetched.
         let mut p = first.div_ceil(PAGE);
         while (p + 1) * PAGE <= first + n {
@@ -656,10 +669,37 @@ impl App {
             let (pad, edit_h, status_h) = self.metrics();
             let w = rc.right - rc.left;
             let h = rc.bottom - rc.top;
-            MoveWindow(self.edit, pad, pad, w - 2 * pad, edit_h, 1);
+            // A single-line EDIT draws its text at the top and ignores EM_SETRECT, so it gets
+            // exactly one line of height, centered inside the painted field.
+            let f = self.field_rect();
+            let inset = scale(6, self.dpi);
+            let line_h = self.edit_line_height().min(edit_h - 2);
+            let y = f.top + (edit_h - line_h) / 2;
+            MoveWindow(self.edit, f.left + inset, y, (f.right - f.left - 2 * inset).max(0), line_h, 1);
             let top = edit_h + 2 * pad;
             MoveWindow(self.list, 0, top, w, (h - top - status_h).max(0), 1);
             self.invalidate_status();
+        }
+    }
+
+    /// The search field's box in client coordinates (painted by us; the EDIT sits inside).
+    fn field_rect(&self) -> RECT {
+        let mut rc: RECT = unsafe { std::mem::zeroed() };
+        unsafe { GetClientRect(self.hwnd, &mut rc) };
+        let (pad, edit_h, _) = self.metrics();
+        RECT { left: pad, top: pad, right: rc.right - pad, bottom: pad + edit_h }
+    }
+
+    /// Height of one line in the current font, i.e. what the EDIT actually needs.
+    fn edit_line_height(&self) -> i32 {
+        unsafe {
+            let hdc = GetDC(self.edit);
+            let old = SelectObject(hdc, self.font as _);
+            let mut tm: TEXTMETRICW = std::mem::zeroed();
+            GetTextMetricsW(hdc, &mut tm);
+            SelectObject(hdc, old);
+            ReleaseDC(self.edit, hdc);
+            tm.tmHeight
         }
     }
 
@@ -732,6 +772,11 @@ impl App {
             // Strip around the search box.
             let top = RECT { left: 0, top: 0, right: rc.right, bottom: edit_h + 2 * pad };
             FillRect(hdc, &top, self.theme.br_bg);
+            // Search field: field-colored box with the same hairline as the column separators.
+            // WS_CLIPCHILDREN keeps this from painting over the EDIT itself.
+            let f = self.field_rect();
+            FillRect(hdc, &f, self.theme.br_field);
+            FrameRect(hdc, &f, self.theme.br_line);
             // Status bar.
             let sr = self.status_rect();
             FillRect(hdc, &sr, self.theme.br_bg);
@@ -812,9 +857,10 @@ impl App {
 
     /// Details = report view with the small system list; the icon views swap in a bigger
     /// size of the same system image list (shared index space, so no icon re-resolve).
-    fn apply_view(&self) {
+    fn apply_view(&mut self) {
         unsafe {
             if self.settings.view == VIEW_DETAILS {
+                self.thumbs.set_size(0);
                 SendMessageW(self.list, LVM_SETVIEW, LV_VIEW_DETAILS as usize, 0);
                 return;
             }
@@ -830,6 +876,7 @@ impl App {
             SendMessageW(self.list, LVM_SETIMAGELIST, LVSIL_NORMAL as usize, il);
             let (mut cx, mut cy) = (32, 32);
             ImageList_GetIconSize(il as HIMAGELIST, &mut cx, &mut cy);
+            self.thumbs.set_size(if self.settings.view >= VIEW_THUMBS_FROM { cx } else { 0 });
             // Cell = icon + room for a two-line label. Without this the ListView keeps
             // the spacing it computed for the previous image size.
             let w = cx + scale(if cx >= 128 { 24 } else { 44 }, self.dpi);
@@ -1384,7 +1431,12 @@ impl App {
                         *di.item.pszText.add(n) = 0;
                     }
                     if di.item.mask & LVIF_IMAGE != 0 {
-                        di.item.iImage = row.map(|r| r.icon).unwrap_or(I_IMAGENONE);
+                        // With a thumbnail cached the ListView must not draw the type icon:
+                        // custom draw paints the picture into the empty icon slot instead.
+                        // Hiding it here (not painting over it) keeps the selection box,
+                        // which the ListView draws behind the icon, intact.
+                        let thumb = self.thumbs.active() && row.is_some_and(|r| !r.dir && self.thumbs.has(&r.full));
+                        di.item.iImage = if thumb { I_IMAGENONE } else { row.map(|r| r.icon).unwrap_or(I_IMAGENONE) };
                     }
                     Some(0)
                 }
@@ -1399,6 +1451,8 @@ impl App {
                     Some(0)
                 }
                 LVN_ODFINDITEMW => Some(-1),
+                // Details view never gets past the guard: it keeps the stock paint path.
+                NM_CUSTOMDRAW if self.thumbs.active() => Some(self.custom_draw(&mut *(lp as *mut NMLVCUSTOMDRAW))),
                 NM_DBLCLK => {
                     let ia = &*(lp as *const NMITEMACTIVATE);
                     if ia.iItem >= 0 {
@@ -1422,6 +1476,106 @@ impl App {
                 }
                 _ => None,
             }
+        }
+    }
+
+    // ---- thumbnails ---------------------------------------------------------------------
+
+    fn custom_draw(&mut self, cd: &mut NMLVCUSTOMDRAW) -> LRESULT {
+        match cd.nmcd.dwDrawStage {
+            // Once per paint pass: cheap to re-aim the worker queue at what's on screen.
+            CDDS_PREPAINT => {
+                self.schedule_thumbs();
+                CDRF_NOTIFYITEMDRAW as LRESULT
+            }
+            CDDS_ITEMPREPAINT => {
+                let i = cd.nmcd.dwItemSpec as u32;
+                let want = self.rows.get(&i).or_else(|| self.stale.get(&i)).is_some_and(|r| !r.dir && self.thumbs.has(&r.full));
+                (if want { CDRF_NOTIFYPOSTPAINT } else { CDRF_DODEFAULT }) as LRESULT
+            }
+            CDDS_ITEMPOSTPAINT => {
+                let i = cd.nmcd.dwItemSpec as u32;
+                if let Some(r) = self.rows.get(&i).or_else(|| self.stale.get(&i)) {
+                    let mut rc = RECT { left: LVIR_ICON as i32, top: 0, right: 0, bottom: 0 };
+                    if unsafe { SendMessageW(self.list, LVM_GETITEMRECT, i as usize, &mut rc as *mut _ as isize) } != 0 {
+                        self.thumbs.draw(cd.nmcd.hdc, &rc, &r.full);
+                    }
+                }
+                CDRF_DODEFAULT as LRESULT
+            }
+            _ => CDRF_DODEFAULT as LRESULT,
+        }
+    }
+
+    /// Rows currently on screen in an icon view. LVM_GETTOPINDEX / GETCOUNTPERPAGE are
+    /// useless there (0 / the total), but an owner-data icon view is always a plain
+    /// auto-arranged grid, so a few item positions give the whole layout.
+    fn visible_range(&self) -> Option<(u32, u32)> {
+        if self.total == 0 {
+            return None;
+        }
+        let pos = |i: u32| {
+            let mut p = POINT { x: 0, y: 0 };
+            unsafe { SendMessageW(self.list, LVM_GETITEMPOSITION, i as usize, &mut p as *mut _ as isize) };
+            p
+        };
+        let mut rc: RECT = unsafe { std::mem::zeroed() };
+        unsafe { GetClientRect(self.list, &mut rc) };
+        let p0 = pos(0);
+        let spacing = unsafe { SendMessageW(self.list, LVM_GETITEMSPACING, 0, 0) } as usize;
+        let (sx, sy) = ((spacing & 0xFFFF).max(1) as i32, ((spacing >> 16) & 0xFFFF).max(1) as i32);
+        // Columns: the spacing estimate, corrected against where the second row starts.
+        let mut cols = ((rc.right - p0.x.max(0)) / sx).clamp(1, self.total as i32) as u32;
+        while cols > 1 && pos(cols - 1).y != p0.y {
+            cols -= 1;
+        }
+        while cols < self.total && pos(cols).y == p0.y {
+            cols += 1;
+        }
+        // Measured row pitch beats the spacing value if the two ever disagree.
+        let pitch = if cols < self.total { (pos(cols).y - p0.y).max(1) } else { sy };
+        let r0 = (-p0.y).div_euclid(pitch).max(0) as u32;
+        let r1 = (rc.bottom - 1 - p0.y).div_euclid(pitch).max(0) as u32;
+        let lo = r0.saturating_mul(cols).min(self.total - 1);
+        let hi = (r1 + 1).saturating_mul(cols).min(self.total) - 1;
+        Some((lo, hi.max(lo)))
+    }
+
+    /// Point the thumbnail workers at the viewport: visible rows first, then one screen
+    /// below (where scrolling usually goes), then half a screen above. Everything else
+    /// is dropped from the queue, which is what keeps a fast scroll from piling up work.
+    fn schedule_thumbs(&mut self) {
+        let Some((lo, hi)) = self.visible_range() else { return };
+        let n = hi - lo + 1;
+        let (wlo, whi) = (lo.saturating_sub(n / 2), (hi + n).min(self.total - 1));
+        if (wlo, whi) == self.thumbs.window && !self.thumbs.dirty {
+            return;
+        }
+        self.thumbs.window = (wlo, whi);
+        self.thumbs.dirty = false;
+        let (rows, thumbs) = (&self.rows, &self.thumbs);
+        let order = (lo..=hi).chain(hi + 1..=whi).chain((wlo..lo).rev());
+        thumbs.schedule(order.filter_map(|i| rows.get(&i).filter(|r| !r.dir && thumbs.wants(&r.full)).map(|r| (i, r.full.as_str()))));
+    }
+
+    fn on_thumb(&mut self, d: Done) {
+        // Check the row before `accept` consumes the path: a new query may have moved it.
+        let same_row = self.rows.get(&d.row).is_some_and(|r| r.full == d.path);
+        let row = d.row;
+        if !self.thumbs.accept(d) {
+            return;
+        }
+        unsafe {
+            if same_row {
+                SendMessageW(self.list, LVM_REDRAWITEMS, row as usize, row as isize);
+            } else {
+                InvalidateRect(self.list, null(), 0);
+            }
+        }
+        if self.thumbs.over_budget() {
+            let (wlo, whi) = self.thumbs.window;
+            let keep: HashSet<&str> = (wlo..=whi).filter_map(|i| self.rows.get(&i)).map(|r| r.full.as_str()).collect();
+            self.thumbs.evict(&keep);
         }
     }
 
@@ -1548,6 +1702,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 0
             }
             WM_ERASEBKGND => 1,
+            // The painted field is larger than the EDIT; clicks on its padding still focus it.
+            WM_LBUTTONDOWN => {
+                let pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
+                if PtInRect(&a.field_rect(), pt) != 0 {
+                    SetFocus(a.edit);
+                    SendMessageW(a.edit, EM_SETSEL, 0, -1);
+                }
+                0
+            }
             WM_CTLCOLOREDIT => {
                 let hdc = wp as HDC;
                 SetTextColor(hdc, a.theme.fg);
@@ -1598,6 +1761,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                 }
                 a.icons.resolved(path, idx);
+                0
+            }
+            WM_APP_THUMB => {
+                let d = Box::from_raw(lp as *mut Done);
+                a.on_thumb(*d);
                 0
             }
             WM_APP_TRAY => {

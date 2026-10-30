@@ -15,6 +15,7 @@ mod install;
 mod ipc;
 mod settings;
 mod shell;
+mod thumbs;
 mod util;
 
 use std::sync::atomic::{AtomicIsize, Ordering};

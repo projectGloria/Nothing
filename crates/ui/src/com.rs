@@ -5,7 +5,8 @@
 use std::ffi::c_void;
 
 use windows_sys::core::{GUID, HRESULT};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, SIZE, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::HBITMAP;
 use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows_sys::Win32::UI::WindowsAndMessaging::HMENU;
 
@@ -15,6 +16,7 @@ pub const IID_ICONTEXTMENU2: GUID = GUID::from_u128(0x000214F4_0000_0000_C000_00
 pub const IID_ICONTEXTMENU3: GUID = GUID::from_u128(0xBCFCE0A0_EC17_11D0_8D10_00A0C90F2719);
 pub const IID_IDATAOBJECT: GUID = GUID::from_u128(0x0000010E_0000_0000_C000_000000000046);
 pub const IID_IIMAGELIST: GUID = GUID::from_u128(0x46EB5926_582E_4017_9FDF_E8998DAA0950);
+pub const IID_ISHELLITEMIMAGEFACTORY: GUID = GUID::from_u128(0xBCC18B79_BA16_442F_80C4_8A59C30C463B);
 
 #[repr(C)]
 pub struct IUnknownVtbl {
@@ -54,6 +56,14 @@ pub struct IContextMenuVtbl {
     pub handle_menu_msg: unsafe extern "system" fn(*mut c_void, u32, WPARAM, LPARAM) -> HRESULT,
     /// IContextMenu3 only.
     pub handle_menu_msg2: unsafe extern "system" fn(*mut c_void, u32, WPARAM, LPARAM, *mut LRESULT) -> HRESULT,
+}
+
+/// Thumbnail (or icon) of a shell item, rendered by the same handlers Explorer uses.
+#[repr(C)]
+pub struct IShellItemImageFactoryVtbl {
+    pub base: IUnknownVtbl,
+    /// SIZE goes by value: 8 bytes, so it travels in one register on x64 like the C ABI.
+    pub get_image: unsafe extern "system" fn(*mut c_void, SIZE, i32, *mut HBITMAP) -> HRESULT,
 }
 
 /// Owned COM pointer, released on drop.
