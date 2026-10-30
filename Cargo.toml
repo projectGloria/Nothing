@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/svc", "crates/ui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+nothing-core = { path = "crates/core" }
+memchr = "2.8"
+windows-sys = "0.61"
+
+# Release = what you run daily. Fat LTO + 1 CGU lets LLVM inline across crates,
+# panic=abort drops unwinding tables, strip drops symbols -> smallest, fastest binaries.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+
+# Tests/benches on a 1.4M-entry index are painful unoptimized.
+[profile.dev]
+opt-level = 1
