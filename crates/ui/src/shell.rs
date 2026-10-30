@@ -16,7 +16,10 @@ use windows_sys::Win32::UI::Shell::{
     ILFindLastID, SHBindToParent, SHDoDragDrop, SHOpenFolderAndSelectItems, SHParseDisplayName, ShellExecuteW, CMF_EXTENDEDVERBS, CMF_NORMAL,
     CMIC_MASK_CONTROL_DOWN, CMIC_MASK_PTINVOKE, CMIC_MASK_SHIFT_DOWN, CMINVOKECOMMANDINFOEX,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{CreatePopupMenu, DestroyMenu, TrackPopupMenuEx, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreatePopupMenu, DestroyMenu, GetMenuDefaultItem, InsertMenuW, TrackPopupMenuEx, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON,
+};
 
 use crate::com::{Com, IContextMenuVtbl, IShellFolderVtbl, IID_ICONTEXTMENU, IID_ICONTEXTMENU2, IID_ICONTEXTMENU3, IID_IDATAOBJECT, IID_ISHELLFOLDER};
 use crate::util::wide;
@@ -131,16 +134,32 @@ fn invoke(cm: &Com, hwnd: HWND, verb_a: *const u8, verb_w: *const u16, pt: POINT
     }
 }
 
-/// Show Explorer's context menu for `paths` at screen point `pt`.
-pub fn context_menu(hwnd: HWND, paths: &[String], pt: POINT) {
-    let Some(it) = items(paths) else { return };
-    let Some(cm) = ui_object(&it, hwnd, &IID_ICONTEXTMENU) else { return };
+/// Shell handlers get command ids 1..=SHELL_LAST; ids above it are free for the caller's
+/// own items (`extra`), so one TrackPopupMenu can serve both.
+pub const SHELL_LAST: u32 = 0x7FFF;
+
+/// Show Explorer's context menu for `paths` at screen point `pt`, with `extra` items
+/// (id > SHELL_LAST, text; id 0 = separator) inserted right under the default verb.
+/// Shell commands run here; a picked `extra` id is returned for the caller to handle.
+pub fn context_menu(hwnd: HWND, paths: &[String], pt: POINT, extra: &[(u32, &str)]) -> Option<u32> {
+    let it = items(paths)?;
+    let cm = ui_object(&it, hwnd, &IID_ICONTEXTMENU)?;
     unsafe {
         let menu = CreatePopupMenu();
         let flags = CMF_NORMAL | if GetKeyState(VK_SHIFT as i32) < 0 { CMF_EXTENDEDVERBS } else { 0 };
-        if (cm.vtbl::<IContextMenuVtbl>().query_context_menu)(cm.0, menu, 0, 1, 0x7FFF, flags) < 0 {
+        if (cm.vtbl::<IContextMenuVtbl>().query_context_menu)(cm.0, menu, 0, 1, SHELL_LAST, flags) < 0 {
             DestroyMenu(menu);
-            return;
+            return None;
+        }
+        // Under the bold default verb ("Open"), like Everything does; top if there is none.
+        let def = GetMenuDefaultItem(menu, 1, 0);
+        let first = if def == u32::MAX { 0 } else { def + 1 };
+        for (pos, &(id, text)) in (first..).zip(extra.iter().chain(std::iter::once(&(0, "")))) {
+            // Bind the UTF-16 buffer first: `wide(text).as_ptr()` inside the `if` would
+            // point into a temporary freed before InsertMenuW reads it.
+            let w = wide(text);
+            let (f, t) = if id == 0 { (MF_SEPARATOR, std::ptr::null()) } else { (MF_STRING, w.as_ptr()) };
+            InsertMenuW(menu, pos, MF_BYPOSITION | f, id as usize, t);
         }
         // Prefer the richest interface for owner-drawn submenu forwarding.
         let (cm3, cm2) = (cm.query(&IID_ICONTEXTMENU3), cm.query(&IID_ICONTEXTMENU2));
@@ -150,14 +169,51 @@ pub fn context_menu(hwnd: HWND, paths: &[String], pt: POINT) {
             _ => (std::ptr::null_mut(), 0),
         };
         ACTIVE.with(|a| a.set(active));
-        let cmd = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, hwnd, std::ptr::null());
+        let cmd = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, hwnd, std::ptr::null()) as u32;
         ACTIVE.with(|a| a.set((std::ptr::null_mut(), 0)));
-        if cmd > 0 {
-            // Verb by ordinal: MAKEINTRESOURCE(cmd - idCmdFirst).
-            let ord = (cmd - 1) as usize;
-            invoke(&cm, hwnd, ord as *const u8, ord as *const u16, pt);
-        }
+        let picked = match cmd {
+            0 => None,
+            c if c > SHELL_LAST => Some(c),
+            c => {
+                // Verb by ordinal: MAKEINTRESOURCE(cmd - idCmdFirst). The menu must still
+                // exist here: some handlers look their items up during InvokeCommand.
+                let ord = (c - 1) as usize;
+                invoke(&cm, hwnd, ord as *const u8, ord as *const u16, pt);
+                None
+            }
+        };
         DestroyMenu(menu);
+        picked
+    }
+}
+
+/// The first context menu in a process is slow (2-3 s on a machine with WinRAR, 7-Zip,
+/// PowerToys, Defender, Drive...): QueryContextMenu loads every shell extension DLL
+/// cold, and the user sees "right-click does nothing". Building and throwing away one
+/// menu on a background STA pays that once, off the UI thread; the DLLs then stay loaded
+/// for the process and the real right-click lands warm (< 1 s, like Explorer's).
+pub fn prewarm() {
+    // Once per process: show() calls this on every summon.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::thread::spawn(|| unsafe { warm() });
+    });
+}
+
+unsafe fn warm() {
+    unsafe {
+        windows_sys::Win32::System::Ole::OleInitialize(std::ptr::null());
+        if let Some(exe) = std::env::current_exe().ok().and_then(|p| p.to_str().map(String::from)) {
+            if let Some(it) = items(&[exe]) {
+                if let Some(cm) = ui_object(&it, std::ptr::null_mut(), &IID_ICONTEXTMENU) {
+                    let menu = CreatePopupMenu();
+                    (cm.vtbl::<IContextMenuVtbl>().query_context_menu)(cm.0, menu, 0, 1, SHELL_LAST, CMF_NORMAL);
+                    DestroyMenu(menu);
+                }
+            }
+        }
+        // `it` and `cm` are dropped (Released) above, before the apartment goes away.
+        windows_sys::Win32::System::Ole::OleUninitialize();
     }
 }
 

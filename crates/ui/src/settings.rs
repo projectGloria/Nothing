@@ -27,6 +27,10 @@ pub struct Settings {
     pub match_path: bool,
     pub hotkey_mods: u32,
     pub hotkey_vk: u32,
+    /// 0 = follow Windows, 1 = light, 2 = dark, 3 = black (see `app::Theme`).
+    pub theme: u8,
+    /// 0 = details, 1 = medium icons, 2 = large icons, 3 = extra large icons.
+    pub view: u8,
 }
 
 impl Default for Settings {
@@ -44,6 +48,8 @@ impl Default for Settings {
             match_path: false,
             hotkey_mods: MOD_WIN | MOD_ALT,
             hotkey_vk: 0x20, // Space
+            theme: 0,
+            view: 0,
         }
     }
 }
@@ -87,6 +93,8 @@ impl Settings {
             match_path: get(&f, "search", "match_path", 0) != 0,
             hotkey_mods: get(&f, "hotkey", "modifiers", d.hotkey_mods as i32) as u32,
             hotkey_vk: get(&f, "hotkey", "key", d.hotkey_vk as i32) as u32,
+            theme: get(&f, "ui", "theme", 0).clamp(0, 3) as u8,
+            view: get(&f, "ui", "view", 0).clamp(0, 3) as u8,
         }
     }
 
@@ -108,5 +116,7 @@ impl Settings {
         set(&f, "search", "match_path", self.match_path as i32);
         set(&f, "hotkey", "modifiers", self.hotkey_mods as i32);
         set(&f, "hotkey", "key", self.hotkey_vk as i32);
+        set(&f, "ui", "theme", self.theme as i32);
+        set(&f, "ui", "view", self.view as i32);
     }
 }

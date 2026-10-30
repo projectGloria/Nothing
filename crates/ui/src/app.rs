@@ -18,7 +18,8 @@ use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::{
-    DefSubclassProc, SetWindowSubclass, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    DefSubclassProc, SetWindowSubclass, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, SHIL_EXTRALARGE, SHIL_JUMBO,
+    SHIL_LARGE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -26,7 +27,7 @@ use crate::icons::Icons;
 use crate::ipc::{Cmd, Event, Ipc};
 use crate::settings::Settings;
 use crate::util::{date, from_wide, human_bytes, join_path, loword, rgb, size_kb, thousands, wide};
-use crate::{dark, install, shell};
+use crate::{dark, icons, install, shell};
 
 pub const CLASS: &str = "NothingMainWnd";
 pub const WM_APP_SHOW: u32 = WM_APP + 4;
@@ -48,11 +49,23 @@ const ID_SELECT_ALL: u16 = 1012;
 const ID_CASE: u16 = 1020;
 const ID_PATH: u16 = 1021;
 const ID_SORT_BASE: u16 = 1030; // +0..3
+const ID_SORT_ASC: u16 = 1034;
+const ID_SORT_DESC: u16 = 1035;
+const ID_REFRESH: u16 = 1036;
 const ID_INSTALL: u16 = 1040;
 const ID_UNINSTALL: u16 = 1041;
 const ID_SYNTAX: u16 = 1050;
 const ID_ABOUT: u16 = 1051;
 const ID_TRAY_SHOW: u16 = 1060;
+const ID_VIEW_BASE: u16 = 1070; // + Settings::view (0 details .. 3 extra large)
+const ID_THEME_BASE: u16 = 1080; // + Settings::theme
+
+// Above shell::SHELL_LAST, so they can share the shell's item context menu.
+const ID_CTX_REVEAL: u32 = 0x8001;
+const ID_CTX_COPY_PATH: u32 = 0x8002;
+
+const VIEW_NAMES: [&str; 4] = ["&Details", "&Medium Icons", "&Large Icons", "E&xtra Large Icons"];
+const SORT_NAMES: [&str; 4] = ["&Name", "&Path", "&Size", "Date &Modified"];
 
 // Undocumented-but-stable messages used to paint the menu bar in dark mode.
 const WM_UAHDRAWMENU: u32 = 0x0091;
@@ -85,6 +98,15 @@ struct RowView {
     full: String,
 }
 
+// Settings::theme values.
+const THEME_SYSTEM: u8 = 0;
+const THEME_LIGHT: u8 = 1;
+const THEME_DARK: u8 = 2;
+const THEME_BLACK: u8 = 3;
+
+// Settings::view values.
+const VIEW_DETAILS: u8 = 0;
+
 struct Theme {
     dark: bool,
     fg: u32,
@@ -93,16 +115,34 @@ struct Theme {
     br_bg: HBRUSH,
     br_field: HBRUSH,
     br_hot: HBRUSH,
+    /// Column separators and the header's bottom edge (dark header is painted by us).
+    br_line: HBRUSH,
 }
 
 impl Theme {
-    fn new(dark: bool) -> Theme {
-        let (bg, fg, dim, field, hot) = if dark {
-            (rgb(32, 32, 32), rgb(232, 232, 232), rgb(160, 160, 160), rgb(16, 16, 16), rgb(64, 64, 64))
-        } else {
-            (rgb(243, 243, 243), rgb(20, 20, 20), rgb(96, 96, 96), rgb(255, 255, 255), rgb(222, 222, 222))
+    /// `kind` is a resolved THEME_LIGHT / THEME_DARK / THEME_BLACK, never THEME_SYSTEM.
+    fn new(kind: u8) -> Theme {
+        // (chrome bg, text, dim text, list/field bg, hover, lines)
+        let (bg, fg, dim, field, hot, line) = match kind {
+            // Near-black like Explorer's dark list (#191919) but a step darker everywhere;
+            // the old 32/16 grey read as "dark grey", not dark.
+            THEME_DARK => (rgb(18, 18, 18), rgb(228, 228, 228), rgb(150, 150, 150), rgb(10, 10, 10), rgb(48, 48, 48), rgb(40, 40, 40)),
+            // True black for OLED: pixels off, chrome separated only by hairlines.
+            THEME_BLACK => (rgb(0, 0, 0), rgb(220, 220, 220), rgb(140, 140, 140), rgb(0, 0, 0), rgb(40, 40, 40), rgb(34, 34, 34)),
+            _ => (rgb(243, 243, 243), rgb(20, 20, 20), rgb(96, 96, 96), rgb(255, 255, 255), rgb(222, 222, 222), rgb(220, 220, 220)),
         };
-        unsafe { Theme { dark, fg, dim, field, br_bg: CreateSolidBrush(bg), br_field: CreateSolidBrush(field), br_hot: CreateSolidBrush(hot) } }
+        unsafe {
+            Theme {
+                dark: kind != THEME_LIGHT,
+                fg,
+                dim,
+                field,
+                br_bg: CreateSolidBrush(bg),
+                br_field: CreateSolidBrush(field),
+                br_hot: CreateSolidBrush(hot),
+                br_line: CreateSolidBrush(line),
+            }
+        }
     }
 }
 
@@ -112,6 +152,7 @@ impl Drop for Theme {
             DeleteObject(self.br_bg as _);
             DeleteObject(self.br_field as _);
             DeleteObject(self.br_hot as _);
+            DeleteObject(self.br_line as _);
         }
     }
 }
@@ -177,14 +218,66 @@ fn make_font(dpi: u32) -> HFONT {
     }
 }
 
+fn add(m: HMENU, id: u16, text: &str) {
+    unsafe { AppendMenuW(m, MF_STRING, id as usize, wide(text).as_ptr()) };
+}
+
+fn sep(m: HMENU) {
+    unsafe { AppendMenuW(m, MF_SEPARATOR, 0, null()) };
+}
+
+fn sub(m: HMENU, popup: HMENU, text: &str) {
+    unsafe { AppendMenuW(m, MF_POPUP, popup as usize, wide(text).as_ptr()) };
+}
+
+/// View ▸ submenu, shared by the menu bar and the list's background context menu.
+fn view_menu() -> HMENU {
+    let m = unsafe { CreatePopupMenu() };
+    // Biggest first, like Explorer/Everything.
+    for v in (0..4u16).rev() {
+        add(m, ID_VIEW_BASE + v, VIEW_NAMES[v as usize]);
+    }
+    m
+}
+
+/// Sort By ▸ submenu, also shared.
+fn sort_menu() -> HMENU {
+    let m = unsafe { CreatePopupMenu() };
+    for (i, n) in SORT_NAMES.iter().enumerate() {
+        add(m, ID_SORT_BASE + i as u16, n);
+    }
+    sep(m);
+    add(m, ID_SORT_ASC, "&Ascending");
+    add(m, ID_SORT_DESC, "&Descending");
+    m
+}
+
+/// Radio bullet on/off for one item, found by command id anywhere under `m` (submenus too).
+/// Per-item instead of CheckMenuRadioItem because the View group is listed in reverse id order.
+fn radio(m: HMENU, id: u16, on: bool) {
+    unsafe {
+        let mut mii: MENUITEMINFOW = std::mem::zeroed();
+        mii.cbSize = std::mem::size_of::<MENUITEMINFOW>() as u32;
+        mii.fMask = MIIM_FTYPE | MIIM_STATE;
+        mii.fType = MFT_RADIOCHECK;
+        mii.fState = if on { MFS_CHECKED } else { MFS_UNCHECKED };
+        SetMenuItemInfoW(m, id as u32, 0, &mii);
+    }
+}
+
+/// Sort / direction / view / theme bullets: the menu bar and the context menu share them.
+fn check_radios(m: HMENU, s: &Settings) {
+    for i in 0..4u8 {
+        radio(m, ID_SORT_BASE + i as u16, s.sort == i);
+        radio(m, ID_VIEW_BASE + i as u16, s.view == i);
+        radio(m, ID_THEME_BASE + i as u16, s.theme == i);
+    }
+    radio(m, ID_SORT_ASC, !s.desc);
+    radio(m, ID_SORT_DESC, s.desc);
+}
+
 fn build_menu() -> HMENU {
     unsafe {
-        let add = |m: HMENU, id: u16, text: &str| {
-            AppendMenuW(m, MF_STRING, id as usize, wide(text).as_ptr());
-        };
-        let sep = |m: HMENU| {
-            AppendMenuW(m, MF_SEPARATOR, 0, null());
-        };
         let bar = CreateMenu();
         let file = CreatePopupMenu();
         add(file, ID_OPEN, "&Open\tEnter");
@@ -200,17 +293,24 @@ fn build_menu() -> HMENU {
         add(search, ID_CASE, "Match &Case\tCtrl+I");
         add(search, ID_PATH, "Match &Path\tCtrl+U");
         sep(search);
-        for (i, n) in ["Name", "Path", "Size", "Date Modified"].iter().enumerate() {
-            add(search, ID_SORT_BASE + i as u16, &format!("Sort by &{n}"));
+        sub(search, sort_menu(), "&Sort By");
+        let view = view_menu();
+        sep(view);
+        add(view, ID_REFRESH, "&Refresh\tF5");
+        let theme = CreatePopupMenu();
+        for (i, n) in ["Use &System Setting", "&Light", "&Dark", "&Black"].iter().enumerate() {
+            add(theme, ID_THEME_BASE + i as u16, n);
         }
         let tools = CreatePopupMenu();
+        sub(tools, theme, "&Theme");
+        sep(tools);
         add(tools, ID_INSTALL, "&Install / Repair Indexing Service…");
         add(tools, ID_UNINSTALL, "&Uninstall…");
         let help = CreatePopupMenu();
         add(help, ID_SYNTAX, "Search &Syntax");
         add(help, ID_ABOUT, "&About Nothing");
-        for (m, t) in [(file, "&File"), (edit, "&Edit"), (search, "&Search"), (tools, "&Tools"), (help, "&Help")] {
-            AppendMenuW(bar, MF_POPUP, m as usize, wide(t).as_ptr());
+        for (m, t) in [(file, "&File"), (edit, "&Edit"), (view, "&View"), (search, "&Search"), (tools, "&Tools"), (help, "&Help")] {
+            sub(bar, m, t);
         }
         bar
     }
@@ -222,7 +322,6 @@ pub fn run(start_hidden: bool) -> i32 {
         let hinst = GetModuleHandleW(null());
         let icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES };
         InitCommonControlsEx(&icc);
-        dark::init_app();
 
         let class = wide(CLASS);
         let icon = LoadImageW(hinst, 1 as _, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED) as HICON;
@@ -303,6 +402,7 @@ pub fn run(start_hidden: bool) -> i32 {
         let header = SendMessageW(list, LVM_GETHEADER, 0, 0) as HWND;
         SetWindowSubclass(list, Some(list_proc), 1, 0);
         SetWindowSubclass(edit, Some(edit_proc), 2, 0);
+        SetWindowSubclass(header, Some(header_proc), 3, 0);
 
         let icons = Icons::new(hwnd, WM_APP_ICON);
         SendMessageW(list, LVM_SETIMAGELIST, LVSIL_SMALL as usize, icons.image_list);
@@ -315,7 +415,7 @@ pub fn run(start_hidden: bool) -> i32 {
             menu,
             font: null_mut(),
             dpi,
-            theme: Theme::new(dark::system_prefers_dark()),
+            theme: Theme::new(THEME_LIGHT), // placeholder: apply_theme resolves the real one
             ipc: Ipc::spawn(hwnd, WM_APP_IPC),
             icons,
             settings,
@@ -358,6 +458,7 @@ pub fn run(start_hidden: bool) -> i32 {
         }
         a.apply_dpi(dpi);
         a.apply_theme();
+        a.apply_view();
         a.update_menu_checks();
         a.update_sort_arrow();
         a.add_tray();
@@ -664,8 +765,19 @@ impl App {
     }
 
     fn apply_theme(&mut self) {
-        let dark = dark::system_prefers_dark();
-        self.theme = Theme::new(dark);
+        let choice = self.settings.theme;
+        let kind = match choice {
+            THEME_SYSTEM if dark::system_prefers_dark() => THEME_DARK,
+            THEME_SYSTEM => THEME_LIGHT,
+            k => k,
+        };
+        // Assigning drops the old Theme, which frees its brushes (see Drop).
+        self.theme = Theme::new(kind);
+        let dark = self.theme.dark;
+        // Popup menus, the shell context menu and scrollbars are themed process-wide,
+        // not per window: an explicit choice has to force uxtheme's mode, or a "Dark"
+        // pick on a light system would still get white menus.
+        dark::set_app_mode(if choice == THEME_SYSTEM { None } else { Some(dark) });
         let t = &self.theme;
         unsafe {
             for h in [self.hwnd, self.list, self.header, self.edit] {
@@ -683,9 +795,62 @@ impl App {
             for h in [self.list, self.header, self.edit] {
                 SendMessageW(h, WM_THEMECHANGED, 0, 0);
             }
+            // Frame + menu bar: SWP_FRAMECHANGED forces a fresh WM_NCPAINT, so the bar is
+            // repainted via WM_UAHDRAWMENU (dark) or the default path (light) right away.
+            SetWindowPos(self.hwnd, null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
             DrawMenuBar(self.hwnd);
-            InvalidateRect(self.hwnd, null(), 1);
+            RedrawWindow(self.hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
         }
+    }
+
+    fn set_theme(&mut self, theme: u8) {
+        self.settings.theme = theme;
+        self.apply_theme();
+        self.update_menu_checks();
+        self.settings.save();
+    }
+
+    /// Details = report view with the small system list; the icon views swap in a bigger
+    /// size of the same system image list (shared index space, so no icon re-resolve).
+    fn apply_view(&self) {
+        unsafe {
+            if self.settings.view == VIEW_DETAILS {
+                SendMessageW(self.list, LVM_SETVIEW, LV_VIEW_DETAILS as usize, 0);
+                return;
+            }
+            let shil = match self.settings.view {
+                1 => SHIL_LARGE,      // 32px @96 DPI
+                2 => SHIL_EXTRALARGE, // 48px
+                _ => SHIL_JUMBO,      // 256px
+            };
+            let il = icons::sys_list(shil);
+            if il == 0 {
+                return;
+            }
+            SendMessageW(self.list, LVM_SETIMAGELIST, LVSIL_NORMAL as usize, il);
+            let (mut cx, mut cy) = (32, 32);
+            ImageList_GetIconSize(il as HIMAGELIST, &mut cx, &mut cy);
+            // Cell = icon + room for a two-line label. Without this the ListView keeps
+            // the spacing it computed for the previous image size.
+            let w = cx + scale(if cx >= 128 { 24 } else { 44 }, self.dpi);
+            let h = cy + scale(40, self.dpi);
+            SendMessageW(self.list, LVM_SETICONSPACING, 0, (w & 0xFFFF | (h & 0xFFFF) << 16) as isize);
+            SendMessageW(self.list, LVM_SETVIEW, LV_VIEW_ICON as usize, 0);
+            SendMessageW(self.list, LVM_ARRANGE, LVA_DEFAULT as usize, 0);
+        }
+    }
+
+    fn set_view(&mut self, view: u8) {
+        if self.settings.view == view {
+            return;
+        }
+        // Remember the details column widths before the report view goes away.
+        if self.settings.view == VIEW_DETAILS {
+            self.save_columns();
+        }
+        self.settings.view = view;
+        self.apply_view();
+        self.update_menu_checks();
     }
 
     fn update_menu_checks(&self) {
@@ -695,8 +860,8 @@ impl App {
             };
             chk(ID_CASE, self.settings.match_case);
             chk(ID_PATH, self.settings.match_path);
-            CheckMenuRadioItem(self.menu, ID_SORT_BASE as u32, ID_SORT_BASE as u32 + 3, ID_SORT_BASE as u32 + self.settings.sort as u32, MF_BYCOMMAND);
         }
+        check_radios(self.menu, &self.settings);
     }
 
     fn update_sort_arrow(&self) {
@@ -743,6 +908,8 @@ impl App {
             SetTimer(self.hwnd, TIMER_STATUS, 500, None);
         }
         self.ipc.send(Cmd::Status);
+        // Not at logon (--startup stays hidden): only once the user actually opens us.
+        shell::prewarm();
     }
 
     fn hide(&mut self) {
@@ -775,14 +942,21 @@ impl App {
                 self.settings.h = r.bottom - r.top;
                 self.settings.maximized = wp.showCmd == SW_SHOWMAXIMIZED as u32 || IsZoomed(self.hwnd) != 0;
             }
-            for i in 0..4 {
-                let w = SendMessageW(self.list, LVM_GETCOLUMNWIDTH, i, 0) as i32;
-                if w > 0 {
-                    self.settings.cols[i] = w * 96 / self.dpi as i32;
-                }
-            }
+        }
+        // In an icon view the columns are hidden; their widths were saved on the switch.
+        if self.settings.view == VIEW_DETAILS {
+            self.save_columns();
         }
         self.settings.save();
+    }
+
+    fn save_columns(&mut self) {
+        for i in 0..4 {
+            let w = unsafe { SendMessageW(self.list, LVM_GETCOLUMNWIDTH, i, 0) as i32 };
+            if w > 0 {
+                self.settings.cols[i] = w * 96 / self.dpi as i32;
+            }
+        }
     }
 
     fn exit(&mut self) {
@@ -1136,6 +1310,16 @@ impl App {
                     self.set_sort(col);
                 }
             }
+            ID_SORT_ASC | ID_SORT_DESC => {
+                let desc = id == ID_SORT_DESC;
+                if desc != self.settings.desc {
+                    // set_sort on the current column is exactly "flip direction".
+                    self.set_sort(self.settings.sort);
+                }
+            }
+            ID_REFRESH => self.run_query(true),
+            x if (ID_VIEW_BASE..ID_VIEW_BASE + 4).contains(&x) => self.set_view((x - ID_VIEW_BASE) as u8),
+            x if (ID_THEME_BASE..ID_THEME_BASE + 4).contains(&x) => self.set_theme((x - ID_THEME_BASE) as u8),
             ID_INSTALL => self.install_service(false),
             ID_UNINSTALL => {
                 let r = unsafe {
@@ -1237,6 +1421,55 @@ impl App {
                     None
                 }
                 _ => None,
+            }
+        }
+    }
+
+    /// Right-click on the list. On a row: Explorer's real menu for the selection, plus
+    /// our Open Path / Copy Full Path. On blank space: View / Sort By / Refresh, like
+    /// Everything (the ListView has already cleared the selection by then, which is why
+    /// this used to show nothing at all).
+    fn context_menu(&mut self, pt: POINT, keyboard: bool) {
+        let on_item = if keyboard {
+            self.selected_count() > 0
+        } else {
+            let mut ht: LVHITTESTINFO = unsafe { std::mem::zeroed() };
+            ht.pt = pt;
+            unsafe {
+                ScreenToClient(self.list, &mut ht.pt);
+                SendMessageW(self.list, LVM_HITTEST, 0, &mut ht as *mut _ as isize) >= 0
+            }
+        };
+        let paths = if on_item { self.selected_paths(10_000) } else { Vec::new() };
+        if paths.is_empty() {
+            self.background_menu(pt);
+            return;
+        }
+        let extra = [(ID_CTX_REVEAL, "Open &Path"), (ID_CTX_COPY_PATH, "Copy &Full Path")];
+        match shell::context_menu(self.hwnd, &paths, pt, &extra) {
+            Some(ID_CTX_REVEAL) => self.reveal_selected(),
+            Some(ID_CTX_COPY_PATH) => self.copy_selected(true),
+            _ => {}
+        }
+    }
+
+    fn background_menu(&mut self, pt: POINT) {
+        unsafe {
+            let m = CreatePopupMenu();
+            sub(m, view_menu(), "&View");
+            sub(m, sort_menu(), "&Sort By");
+            sep(m);
+            add(m, ID_SELECT_ALL, "Select &All	Ctrl+A");
+            add(m, ID_REFRESH, "&Refresh	F5");
+            check_radios(m, &self.settings);
+            if self.total == 0 {
+                EnableMenuItem(m, ID_SELECT_ALL as u32, MF_BYCOMMAND | MF_GRAYED);
+            }
+            let cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, self.hwnd, null());
+            // Destroying the parent destroys the attached submenus too.
+            DestroyMenu(m);
+            if cmd > 0 {
+                self.on_command(cmd as u16);
             }
         }
     }
@@ -1343,10 +1576,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     pt = POINT { x: r.left, y: r.bottom };
                     ClientToScreen(a.list, &mut pt);
                 }
-                let paths = a.selected_paths(10_000);
-                if !paths.is_empty() {
-                    shell::context_menu(hwnd, &paths, pt);
-                }
+                a.context_menu(pt, lp == -1);
                 0
             }
             WM_TIMER if wp == TIMER_STATUS => {
@@ -1456,23 +1686,106 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
 }
 
-/// ListView subclass: header text colour in dark mode, and typing-to-search.
+/// Dark header, painted entirely by us. Custom draw can't do it: DarkMode_ItemsView fills
+/// the item backgrounds and the empty area right of the last column with its own fixed
+/// grey (#191919-ish) before any CDDS stage lets us in, so it never matches our palette.
+fn paint_header(a: &App, hwnd: HWND) {
+    unsafe {
+        let mut ps: PAINTSTRUCT = std::mem::zeroed();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        let mut rc: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut rc);
+        // Double-buffer: a column drag repaints on every mouse move.
+        let mem = CreateCompatibleDC(hdc);
+        let bmp = CreateCompatibleBitmap(hdc, rc.right.max(1), rc.bottom.max(1));
+        let old_bmp = SelectObject(mem, bmp as _);
+        FillRect(mem, &rc, a.theme.br_bg);
+
+        // Hover / pressed come from the live cursor: the themed header already
+        // invalidates itself when the hot item changes, so this stays in sync.
+        let mut ht: HDHITTESTINFO = std::mem::zeroed();
+        GetCursorPos(&mut ht.pt);
+        ScreenToClient(hwnd, &mut ht.pt);
+        let hot = if PtInRect(&rc, ht.pt) != 0 { SendMessageW(hwnd, HDM_HITTEST, 0, &mut ht as *mut _ as isize) as i32 } else { -1 };
+
+        let font = SendMessageW(hwnd, WM_GETFONT, 0, 0);
+        let old_font = SelectObject(mem, font as _);
+        SetBkMode(mem, TRANSPARENT as i32);
+        SetTextColor(mem, a.theme.fg);
+        let n = SendMessageW(hwnd, HDM_GETITEMCOUNT, 0, 0) as i32;
+        let (pad, line) = (scale(8, a.dpi), scale(1, a.dpi).max(1));
+        for i in 0..n {
+            let mut r: RECT = std::mem::zeroed();
+            SendMessageW(hwnd, HDM_GETITEMRECT, i as usize, &mut r as *mut _ as isize);
+            if i == hot {
+                FillRect(mem, &r, a.theme.br_hot);
+            }
+            let mut buf = [0u16; 64];
+            let mut it: HDITEMW = std::mem::zeroed();
+            it.mask = HDI_TEXT | HDI_FORMAT;
+            it.pszText = buf.as_mut_ptr();
+            it.cchTextMax = buf.len() as i32;
+            SendMessageW(hwnd, HDM_GETITEMW, i as usize, &mut it as *mut _ as isize);
+            let mut tr = RECT { left: r.left + pad, right: r.right - pad, ..r };
+            let align = if it.fmt & HDF_RIGHT != 0 { DT_RIGHT } else { DT_LEFT };
+            DrawTextW(mem, buf.as_mut_ptr(), -1, &mut tr, align | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            // Sort chevron centred on top, where Explorer puts it.
+            if it.fmt & (HDF_SORTUP | HDF_SORTDOWN) != 0 {
+                let cx = (r.left + r.right) / 2;
+                let (w, h) = (scale(4, a.dpi), scale(2, a.dpi).max(2));
+                let (y0, y1) = if it.fmt & HDF_SORTUP != 0 { (r.top + h + scale(2, a.dpi), r.top + scale(2, a.dpi)) } else { (r.top + scale(2, a.dpi), r.top + h + scale(2, a.dpi)) };
+                let pen = CreatePen(PS_SOLID, line, a.theme.dim);
+                let old_pen = SelectObject(mem, pen as _);
+                let pts = [POINT { x: cx - w, y: y0 }, POINT { x: cx, y: y1 }, POINT { x: cx + w, y: y0 }];
+                Polyline(mem, pts.as_ptr(), 3);
+                SelectObject(mem, old_pen);
+                DeleteObject(pen as _);
+            }
+            // Column separator, inset like Explorer's.
+            let inset = scale(4, a.dpi);
+            let sep = RECT { left: r.right - line, right: r.right, top: r.top + inset, bottom: r.bottom - inset };
+            FillRect(mem, &sep, a.theme.br_line);
+        }
+        let bottom = RECT { top: rc.bottom - line, ..rc };
+        FillRect(mem, &bottom, a.theme.br_line);
+
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old_font);
+        SelectObject(mem, old_bmp);
+        DeleteObject(bmp as _);
+        DeleteDC(mem);
+        EndPaint(hwnd, &ps);
+    }
+}
+
+/// Header subclass: full custom paint in dark themes, stock (themed) paint in light.
+unsafe extern "system" fn header_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    unsafe {
+        if let Some(a) = app() {
+            if a.theme.dark {
+                match msg {
+                    WM_ERASEBKGND => return 1,
+                    WM_PAINT => {
+                        paint_header(a, hwnd);
+                        return 0;
+                    }
+                    // The stock header only repaints the hot item it tracked itself; with
+                    // our own paint a full invalidate on leave avoids a stuck hover.
+                    WM_MOUSELEAVE => {
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        DefSubclassProc(hwnd, msg, wp, lp)
+    }
+}
+
+/// ListView subclass: typing-to-search.
 unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
     unsafe {
         if let Some(a) = app() {
-            if msg == WM_NOTIFY && a.theme.dark {
-                let hdr = &*(lp as *const NMHDR);
-                if hdr.hwndFrom == a.header && hdr.code == NM_CUSTOMDRAW {
-                    let cd = &*(lp as *const NMCUSTOMDRAW);
-                    if cd.dwDrawStage == CDDS_PREPAINT {
-                        return CDRF_NOTIFYITEMDRAW as LRESULT;
-                    }
-                    if cd.dwDrawStage == CDDS_ITEMPREPAINT {
-                        SetTextColor(cd.hdc, a.theme.fg);
-                        return CDRF_DODEFAULT as LRESULT;
-                    }
-                }
-            }
             if msg == WM_CHAR {
                 let c = wp as u32;
                 // Printable characters (and Backspace) typed into the list go to the search box.

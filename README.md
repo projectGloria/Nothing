@@ -57,7 +57,8 @@ Search ▸ Match Case (Ctrl+I) and Match Path (Ctrl+U) apply to every term.
 
 Enter open · Ctrl+Enter open containing folder · Ctrl+C copy files · Ctrl+Shift+C copy
 full paths · Del delete (Recycle Bin, Explorer's own dialogs) · Alt+Enter properties ·
-Shift+F10 / right-click full Explorer context menu · drag rows into any app ·
+Shift+F10 / right-click full Explorer context menu (plus Open Path / Copy Full Path) ·
+right-click blank space for View / Sort By / Refresh · drag rows into any app ·
 Ctrl+A select all · Tab / ↓ / ↑ move between search box and list · typing in the list goes
 to the search box · Esc clears the search, then hides · F5 refresh · click headers to sort.
 
@@ -118,9 +119,11 @@ nothing-svc --walk C:\Users\me --serve               # unelevated: directory-wal
 ## Settings
 
 `%APPDATA%\Nothing\settings.ini` holds the window position, column widths, sort and
-search options, and the hotkey (`[hotkey] modifiers=` Alt 1, Ctrl 2, Shift 4, Win 8;
-`key=` virtual-key code). The theme follows Windows; set `NOTHING_THEME=light|dark` to
-override it.
+search options, the hotkey (`[hotkey] modifiers=` Alt 1, Ctrl 2, Shift 4, Win 8;
+`key=` virtual-key code), and `[ui] theme=` / `view=`. **Tools ▸ Theme** picks Use System
+Setting, Light, Dark or Black (OLED); **View** switches between Details and Medium / Large /
+Extra Large icons. With Use System Setting, `NOTHING_THEME=light|dark` still overrides
+Windows.
 
 ## Limits (v1)
 

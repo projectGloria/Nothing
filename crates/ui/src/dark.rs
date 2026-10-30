@@ -49,12 +49,19 @@ fn uxtheme(ordinal: usize) -> Option<unsafe extern "system" fn() -> isize> {
     }
 }
 
-/// Process-wide: let menus/context menus follow the system theme.
-pub fn init_app() {
+/// Process-wide PreferredAppMode for popup/context menus and scrollbars:
+/// `None` = follow the system (AllowDark), `Some(true)` = ForceDark, `Some(false)` = ForceLight.
+/// Menus cache their theme, so `refresh` (FlushMenuThemes) must follow every change.
+pub fn set_app_mode(force: Option<bool>) {
+    let mode = match force {
+        None => 1,
+        Some(true) => 2,
+        Some(false) => 3,
+    };
     unsafe {
         if let Some(f) = uxtheme(135) {
             let set_mode: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(f);
-            set_mode(1); // AllowDark: follow the system setting
+            set_mode(mode);
         }
         refresh();
     }

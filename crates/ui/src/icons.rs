@@ -11,9 +11,10 @@ use std::sync::mpsc::{channel, Sender};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-use windows_sys::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES};
+use windows_sys::Win32::UI::Shell::{SHGetFileInfoW, SHGetImageList, SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES};
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
+use crate::com::IID_IIMAGELIST;
 use crate::util::wide;
 
 const OWN_ICON: &[&str] = &["exe", "lnk", "ico", "url", "cur", "ani", "msc", "cpl", "scr", "appref-ms", "website"];
@@ -32,6 +33,17 @@ fn sys_index(path: &str, attrs: u32, use_attrs: bool) -> (isize, i32) {
     let flags = SHGFI_SYSICONINDEX | SHGFI_SMALLICON | if use_attrs { SHGFI_USEFILEATTRIBUTES } else { 0 };
     let h = unsafe { SHGetFileInfoW(wide(path).as_ptr(), attrs, &mut sfi, std::mem::size_of::<SHFILEINFOW>() as u32, flags) };
     (h as isize, if h == 0 { -1 } else { sfi.iIcon })
+}
+
+/// A bigger size (`SHIL_LARGE` / `SHIL_EXTRALARGE` / `SHIL_JUMBO`) of the same system image
+/// list. Every size shares one index space, so the indices we already resolved for the
+/// small list are valid here too: switching view needs no re-resolve. Returns an
+/// HIMAGELIST (IImageList* and HIMAGELIST are the same pointer). It is a per-process
+/// singleton, so the reference we get is deliberately never released.
+pub fn sys_list(shil: u32) -> isize {
+    let mut p = std::ptr::null_mut();
+    let hr = unsafe { SHGetImageList(shil as i32, &IID_IIMAGELIST, &mut p) };
+    if hr < 0 { 0 } else { p as isize }
 }
 
 impl Icons {
