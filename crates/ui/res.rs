@@ -84,7 +84,7 @@ fn make_ico(path: &std::path::Path) {
 
 const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="Nothing" version="0.1.0.0"/>
+  <assemblyIdentity type="win32" name="Nothing" version="{VERSION}"/>
   <dependency>
     <dependentAssembly>
       <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0"
@@ -112,7 +112,8 @@ fn embed_resources() {
     let ico = out.join("app.ico");
     let manifest = out.join("app.manifest");
     make_ico(&ico);
-    std::fs::write(&manifest, MANIFEST).unwrap();
+    // Four-part assembly version from the workspace version, so Cargo.toml stays the only place to bump.
+    std::fs::write(&manifest, MANIFEST.replace("{VERSION}", &format!("{}.0", env!("CARGO_PKG_VERSION")))).unwrap();
     let esc = |p: &std::path::Path| p.display().to_string().replace('\\', "\\\\");
     let rc = out.join("app.rc");
     std::fs::write(&rc, format!("1 ICON \"{}\"\n1 24 \"{}\"\n", esc(&ico), esc(&manifest))).unwrap();

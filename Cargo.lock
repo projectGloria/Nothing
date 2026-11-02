@@ -74,7 +74,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "nothing"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "embed-resource",
  "nothing-core",
@@ -83,22 +83,29 @@ dependencies = [
 
 [[package]]
 name = "nothing-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "memchr",
 ]
 
 [[package]]
 name = "nothing-setup"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "embed-resource",
  "windows-sys",
 ]
 
 [[package]]
+name = "nothing-shell"
+version = "1.0.0"
+dependencies = [
+ "windows-sys",
+]
+
+[[package]]
 name = "nothing-svc"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "nothing-core",
  "windows-sys",

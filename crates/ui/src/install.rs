@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
-use windows_sys::Win32::System::Registry::{RegDeleteKeyValueW, RegDeleteTreeW, RegSetKeyValueW, HKEY_LOCAL_MACHINE, REG_DWORD, REG_SZ};
+use windows_sys::Win32::System::Registry::{
+    RegDeleteKeyValueW, RegDeleteTreeW, RegGetValueW, RegSetKeyValueW, HKEY_LOCAL_MACHINE, REG_DWORD, REG_MULTI_SZ, REG_SZ, RRF_RT_REG_MULTI_SZ, RRF_RT_REG_SZ,
+};
 use windows_sys::Win32::System::Services::{
     ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW,
     QueryServiceStatus, StartServiceW, SC_ACTION, SC_ACTION_RESTART, SC_HANDLE, SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SERVICE_ALL_ACCESS,
@@ -24,6 +26,20 @@ pub const SERVICE_NAME: &str = "NothingIndex";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 /// Makes Nothing show up (and uninstallable) in Settings > Apps > Installed apps.
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Nothing";
+/// Explorer right-click verbs: on a folder, on a drive, and on the empty space inside an
+/// open folder (`%V` = that folder). Classic shell verbs: on Windows 11 they appear under
+/// "Show more options"; the compact menu only takes packaged IExplorerCommand handlers.
+const VERBS: [(&str, &str); 3] = [
+    (r"Software\Classes\Directory\shell\Nothing", "%1"),
+    (r"Software\Classes\Drive\shell\Nothing", "%1"),
+    (r"Software\Classes\Directory\Background\shell\Nothing", "%V"),
+];
+/// Sparse identity package (package/AppxManifest.xml) that registers nothing_shell.dll as
+/// the compact-menu handler. Name = the manifest's Identity Name.
+const PACKAGE_NAME: &str = "projectGloria.Nothing";
+/// Compact-menu payload. Optional: a dev build run with `nothing.exe --install` has none of
+/// it and just gets the classic verbs.
+const PACKAGE_FILES: [&str; 3] = ["nothing_shell.dll", "nothing.msix", "nothing.png"];
 
 fn reg_sz(key: &str, name: &str, value: &str) {
     let v = wide(value);
@@ -61,7 +77,7 @@ fn register_uninstaller(dst: &Path) {
     reg_sz(k, "URLInfoAbout", "https://github.com/projectGloria/Nothing");
     reg_dword(k, "NoModify", 1);
     reg_dword(k, "NoRepair", 1);
-    let bytes: u64 = ["nothing.exe", "nothing-svc.exe"].iter().filter_map(|f| std::fs::metadata(dst.join(f)).ok()).map(|m| m.len()).sum();
+    let bytes: u64 = ["nothing.exe", "nothing-svc.exe", "nothing_shell.dll"].iter().filter_map(|f| std::fs::metadata(dst.join(f)).ok()).map(|m| m.len()).sum();
     reg_dword(k, "EstimatedSize", (bytes / 1024) as u32);
 }
 
@@ -161,6 +177,78 @@ fn copy_into(src_dir: &Path, dst: &Path, name: &str) -> std::io::Result<()> {
     std::fs::copy(&from, &to).map(|_| ())
 }
 
+const SESSION_MANAGER: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager";
+
+/// Undo an earlier uninstall's delete-at-reboot entries for `dir`. Uninstall can't delete
+/// the running nothing.exe (or the folder holding it), so it queues them with MoveFileEx;
+/// installing again before a reboot would otherwise lose the fresh nothing.exe at the next
+/// boot. The queue is a REG_MULTI_SZ of (source, target) pairs, target "" meaning delete;
+/// only those delete pairs under `dir` go, everything else is written back untouched.
+fn cancel_pending_deletes(dir: &Path) {
+    // Newer builds spill into PendingFileRenameOperations2 once the first value is large.
+    for value in ["PendingFileRenameOperations", "PendingFileRenameOperations2"] {
+        let Some(list) = read_multi_sz(SESSION_MANAGER, value) else { continue };
+        let Some(kept) = without_deletes_under(&list, dir) else { continue };
+        if kept.is_empty() {
+            unsafe { RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, wide(SESSION_MANAGER).as_ptr(), wide(value).as_ptr()) };
+        } else {
+            let mut data: Vec<u16> = kept.iter().flat_map(|s| s.encode_utf16().chain(std::iter::once(0))).collect();
+            data.push(0); // the empty string that ends a MULTI_SZ
+            unsafe {
+                RegSetKeyValueW(
+                    HKEY_LOCAL_MACHINE,
+                    wide(SESSION_MANAGER).as_ptr(),
+                    wide(value).as_ptr(),
+                    REG_MULTI_SZ,
+                    data.as_ptr() as *const _,
+                    (data.len() * 2) as u32,
+                )
+            };
+        }
+    }
+}
+
+/// The pending-rename list minus delete pairs whose source is `dir` or inside it, flattened
+/// back to strings; None if nothing of ours was queued (so the value is left alone).
+fn without_deletes_under(list: &[String], dir: &Path) -> Option<Vec<String>> {
+    let d = dir.display().to_string().to_lowercase();
+    // Sources look like `\??\C:\...`, on recent builds prefixed `*1` (a flags marker).
+    let ours = |src: &str| {
+        let p = src.trim_start_matches(|c: char| c == '*' || c.is_ascii_digit());
+        let p = p.strip_prefix(r"\??\").unwrap_or(p).to_lowercase();
+        // `C:\Program Files\Nothing2` must not match `C:\Program Files\Nothing`.
+        p == d || p.starts_with(&format!("{d}\\"))
+    };
+    // An odd trailing element is the list's own terminator, not a pair.
+    let pairs: Vec<&[String]> = list.chunks(2).filter(|p| p.len() == 2 && !p[0].is_empty()).collect();
+    let kept: Vec<&[String]> = pairs.iter().copied().filter(|p| !(p[1].is_empty() && ours(&p[0]))).collect();
+    (kept.len() != pairs.len()).then(|| kept.concat())
+}
+
+/// All strings of a REG_MULTI_SZ, empty ones included (they're meaningful above), so the
+/// data is split by its byte length rather than at the first double NUL.
+fn read_multi_sz(key: &str, value: &str) -> Option<Vec<String>> {
+    let (k, v) = (wide(key), wide(value));
+    let mut size = 0u32;
+    let get = |buf: *mut u16, size: &mut u32| unsafe {
+        RegGetValueW(HKEY_LOCAL_MACHINE, k.as_ptr(), v.as_ptr(), RRF_RT_REG_MULTI_SZ, std::ptr::null_mut(), buf as *mut _, size)
+    };
+    if get(std::ptr::null_mut(), &mut size) != 0 {
+        return None; // no such value: nothing is queued
+    }
+    let mut buf = vec![0u16; size as usize / 2 + 1];
+    size = (buf.len() * 2) as u32;
+    if get(buf.as_mut_ptr(), &mut size) != 0 {
+        return None;
+    }
+    buf.truncate(size as usize / 2);
+    // Drop the terminating NUL of the last string; what's left splits into the strings.
+    if buf.last() == Some(&0) {
+        buf.pop();
+    }
+    Some(buf.split(|&c| c == 0).map(String::from_utf16_lossy).collect())
+}
+
 /// Elevated part of `--install`. Returns a process exit code.
 pub fn install() -> i32 {
     let src = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
@@ -170,6 +258,7 @@ pub fn install() -> i32 {
     }
     let dst = install_dir();
     stop_other_uis();
+    cancel_pending_deletes(&dst);
     if let Err(e) = std::fs::create_dir_all(&dst) {
         crate::app::message("Install", &format!("Cannot create {}: {e}", dst.display()), true);
         return 3;
@@ -190,6 +279,10 @@ pub fn install() -> i32 {
                 crate::app::message("Install", &format!("Copying {f} failed: {e}"), true);
                 return 5;
             }
+        }
+        // Explorer keeps nothing_shell.dll loaded; copy_into renames it out of the way.
+        for f in PACKAGE_FILES.into_iter().filter(|f| src.join(f).exists()) {
+            let _ = copy_into(&src, &dst, f);
         }
         let bin = wide(&format!("\"{}\"", dst.join("nothing-svc.exe").display()));
         let svc = if !existing.is_null() {
@@ -252,7 +345,77 @@ pub fn install() -> i32 {
     }
     reg_sz(RUN_KEY, "Nothing", &format!("\"{}\" --startup", dst.join("nothing.exe").display()));
     register_uninstaller(&dst);
+    register_verbs(&dst);
+    register_package(&dst);
     0
+}
+
+fn register_verbs(dst: &Path) {
+    let exe = dst.join("nothing.exe");
+    for (key, arg) in VERBS {
+        reg_sz(key, "", "Nothing");
+        reg_sz(key, "Icon", &format!("\"{}\",0", exe.display()));
+        reg_sz(&format!(r"{key}\command"), "", &format!("\"{}\" --folder \"{arg}\"", exe.display()));
+    }
+}
+
+/// Windows build number (22000+ = Windows 11), from the registry: GetVersionEx lies to
+/// exes without a matching supportedOS entry, and this one is a plain string anyway.
+fn windows_build() -> u32 {
+    let mut buf = [0u16; 16];
+    let mut len = (buf.len() * 2) as u32;
+    let key = wide(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+    let ok = unsafe {
+        RegGetValueW(HKEY_LOCAL_MACHINE, key.as_ptr(), wide("CurrentBuildNumber").as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), buf.as_mut_ptr() as *mut _, &mut len)
+    } == 0;
+    if ok { crate::util::from_wide(&buf).parse().unwrap_or(0) } else { 0 }
+}
+
+/// Run a PowerShell snippet hidden; true if it exited 0. The Appx cmdlets have no Win32
+/// equivalent (PackageManager is WinRT), and this runs once per install.
+fn powershell(script: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"])
+        .arg(format!("$ErrorActionPreference = 'Stop'; {script}"))
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// PowerShell single-quoted string literal.
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Remove every registration of the identity package, for all users.
+fn unregister_package() {
+    powershell(&format!("Get-AppxPackage -AllUsers -Name {} | Remove-AppxPackage -AllUsers", ps_quote(PACKAGE_NAME)));
+}
+
+/// Windows 11 compact menu: register the sparse package with the install folder as its
+/// external location. It's unsigned (see crates/setup/build.rs), which Windows only
+/// accepts elevated and installs for all users; -AllowUnsigned is harmless on a signed
+/// build. On success the classic folder verbs go, or "Show more options" lists Nothing
+/// twice; the Drive verb stays because the package schema has no Drive item type.
+fn register_package(dst: &Path) {
+    let msix = dst.join("nothing.msix");
+    if windows_build() < 22000 || !msix.exists() || !dst.join("nothing_shell.dll").exists() {
+        return; // Windows 10 has no compact menu: the classic verbs are the menu
+    }
+    // Re-registering the same version fails (0x80073CF9), so always start clean.
+    unregister_package();
+    let ok = powershell(&format!(
+        "Add-AppxPackage -Path {} -ExternalLocation {} -AllowUnsigned",
+        ps_quote(&msix.display().to_string()),
+        ps_quote(&dst.display().to_string())
+    ));
+    if ok {
+        for (key, _) in VERBS.iter().filter(|(k, _)| !k.contains(r"\Drive\")) {
+            unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(key).as_ptr()) };
+        }
+    }
 }
 
 /// Elevated part of `--uninstall`.
@@ -262,15 +425,21 @@ pub fn uninstall() -> i32 {
         unsafe { DeleteService(s.0) };
     }
     stop_other_uis();
+    unregister_package();
     unsafe {
         RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, wide(RUN_KEY).as_ptr(), wide("Nothing").as_ptr());
         RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(UNINSTALL_KEY).as_ptr());
+        for (key, _) in VERBS {
+            RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(key).as_ptr());
+        }
     }
     if let Some(pd) = std::env::var_os("ProgramData") {
         let _ = std::fs::remove_dir_all(PathBuf::from(pd).join("Nothing"));
     }
     let dir = install_dir();
-    for f in ["nothing-svc.exe", "nothing.exe", "nothing.exe.old", "nothing-svc.exe.old"] {
+    // Explorer may still have nothing_shell.dll loaded: that one usually goes at reboot.
+    let files = ["nothing-svc.exe", "nothing.exe", "nothing_shell.dll", "nothing.msix", "nothing.png"];
+    for f in files.iter().flat_map(|f| [f.to_string(), format!("{f}.old")]) {
         let p = dir.join(f);
         if p.exists() && std::fs::remove_file(&p).is_err() {
             // Still running (that's us): delete at next boot.
@@ -281,4 +450,38 @@ pub fn uninstall() -> i32 {
         unsafe { MoveFileExW(wide(&dir.display().to_string()).as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) };
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn pending_deletes_only_ours_go() {
+        let dir = Path::new(r"C:\Program Files\Nothing");
+        // As read from this machine after an uninstall, plus a stray terminator element.
+        let list = strs(&[r"*1\??\C:\Program Files\Nothing\nothing.exe", "", r"*1\??\C:\Program Files\Nothing", "", ""]);
+        assert_eq!(without_deletes_under(&list, dir), Some(vec![]));
+
+        let list = strs(&[
+            r"\??\C:\Windows\Temp\other.dll", "",                                   // someone else's delete
+            r"\??\c:\program files\nothing\NOTHING.EXE", "",                        // ours, any case
+            r"\??\C:\Program Files\Nothing2\x.exe", "",                             // prefix lookalike
+            r"\??\C:\Temp\new.dll", r"!\??\C:\Program Files\Nothing\nothing_shell.dll", // rename into our dir
+        ]);
+        let kept = strs(&[
+            r"\??\C:\Windows\Temp\other.dll", "",
+            r"\??\C:\Program Files\Nothing2\x.exe", "",
+            r"\??\C:\Temp\new.dll", r"!\??\C:\Program Files\Nothing\nothing_shell.dll",
+        ]);
+        assert_eq!(without_deletes_under(&list, dir), Some(kept));
+
+        // Nothing of ours queued: leave the value alone.
+        assert_eq!(without_deletes_under(&strs(&[r"\??\C:\a", ""]), dir), None);
+        assert_eq!(without_deletes_under(&[], dir), None);
+    }
 }

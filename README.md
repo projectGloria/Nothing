@@ -224,6 +224,7 @@ nothing.exe --uninstall
 ### Prerequisites
 - **Windows 10 / 11 (x64)**
 - **Rust stable** with the **MSVC toolchain** (`x86_64-pc-windows-msvc`)
+- **Windows SDK** (for `makeappx.exe`, used by the installer build)
 - Administrator privileges for building the installer and interacting with raw NTFS volumes
 
 ### Repository Layout
@@ -231,9 +232,18 @@ nothing.exe --uninstall
 crates/
 ├── core/   # Indexing engine, SIMD search, snapshot format, pipe protocol (pure Rust, unit tested)
 ├── svc/    # nothing-svc.exe: MFT reader, USN journal tailer, service host, named-pipe server
-├── ui/     # nothing.exe: native Win32 window, virtual list, dark theme, Explorer shell, tray hotkey
-└── setup/  # nothing-setup.exe: single-binary self-extracting installer and uninstaller
+├── ui/       # nothing.exe: native Win32 window, virtual list, dark theme, Explorer shell, tray hotkey
+├── shellext/ # nothing_shell.dll: IExplorerCommand handler for Windows 11's compact right-click menu
+└── setup/    # nothing-setup.exe: single-binary self-extracting installer and uninstaller
+package/
+└── AppxManifest.xml  # sparse identity package that registers nothing_shell.dll with Explorer
 ```
+
+The installer build packs `package/AppxManifest.xml` into `nothing.msix` with `makeappx.exe`, so it
+needs the **Windows 10/11 SDK**. The package is unsigned by default (Windows 11 accepts it via
+`Add-AppxPackage -AllowUnsigned` from the elevated install step). To sign it, set `NOTHING_SIGN_PFX`,
+`NOTHING_SIGN_PASSWORD` and `NOTHING_SIGN_PUBLISHER` (the cert's exact subject) before building.
+On Windows 10, or if registration fails, the classic `shell\Nothing` verbs remain in place.
 
 ### Build Commands
 

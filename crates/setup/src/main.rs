@@ -25,6 +25,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 static UI: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nothing.exe"));
 static SVC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nothing-svc.exe"));
+// Windows 11 compact context menu: the handler DLL, the sparse package that declares it,
+// and the package logo. See package/AppxManifest.xml.
+static SHELL_DLL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nothing_shell.dll"));
+static MSIX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nothing.msix"));
+static LOGO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nothing.png"));
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ID_INSTALL: i32 = 100;
@@ -105,6 +110,7 @@ fn main() {
              • Installs to {}\n\
              • Adds the \"Nothing Index\" background service (reads the NTFS file table; needs admin once)\n\
              • Starts with Windows in the tray — press Win+Alt+Space anywhere\n\
+             • Adds \"Nothing\" to the right-click menu of folders and drives\n\
              • Uninstall any time from Settings ▸ Apps",
             dir.display()
         );
@@ -117,11 +123,11 @@ fn main() {
         launch = checked;
     }
 
-    // Unpack the payload next to each other (install() expects nothing-svc.exe beside nothing.exe).
+    // Unpack the payload next to each other (install() picks up its files beside nothing.exe).
     let tmp = std::env::temp_dir().join(format!("nothing-setup-{}", std::process::id()));
-    let unpacked = std::fs::create_dir_all(&tmp)
-        .and_then(|_| std::fs::write(tmp.join("nothing.exe"), UI))
-        .and_then(|_| std::fs::write(tmp.join("nothing-svc.exe"), SVC));
+    let files: [(&str, &[u8]); 5] =
+        [("nothing.exe", UI), ("nothing-svc.exe", SVC), ("nothing_shell.dll", SHELL_DLL), ("nothing.msix", MSIX), ("nothing.png", LOGO)];
+    let unpacked = std::fs::create_dir_all(&tmp).and_then(|_| files.iter().try_for_each(|(name, bytes)| std::fs::write(tmp.join(name), bytes)));
     if let Err(e) = unpacked {
         error(&format!("Could not unpack to {}: {e}", tmp.display()));
         return;

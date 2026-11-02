@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Sparse ("external location") identity package. It installs no files: registering it with
+  -ExternalLocation <install dir> gives Nothing a package identity, which is what Windows 11
+  requires before it puts a verb in the compact context menu. The verbs below point Explorer
+  at nothing_shell.dll (crates/shellext) in the install folder.
+
+  crates/setup/build.rs fills in {VERSION} and {PUBLISHER}, then packs this with MakeAppx.
+  The Clsid must match CLSID_NOTHING in crates/shellext/src/lib.rs.
+-->
+<Package IgnorableNamespaces="uap uap10 desktop4 desktop5 com rescap"
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+  xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
+  <Identity Name="projectGloria.Nothing" Publisher="{PUBLISHER}" Version="{VERSION}" ProcessorArchitecture="neutral" />
+  <Properties>
+    <DisplayName>Nothing</DisplayName>
+    <PublisherDisplayName>projectGloria</PublisherDisplayName>
+    <Logo>nothing.png</Logo>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+  </Properties>
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="unvirtualizedResources" />
+  </Capabilities>
+  <Applications>
+    <Application Id="Nothing" Executable="nothing.exe" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
+      <!-- AppListEntry="none": the identity package must not show up as a second app in Start. -->
+      <uap:VisualElements AppListEntry="none" DisplayName="Nothing" Description="Instant file-name search"
+        BackgroundColor="transparent" Square150x150Logo="nothing.png" Square44x44Logo="nothing.png" />
+      <Extensions>
+        <desktop4:Extension Category="windows.fileExplorerContextMenus">
+          <desktop4:FileExplorerContextMenus>
+            <!-- The schema only takes "*", ".ext", Directory and Directory\Background: no Drive. -->
+            <desktop5:ItemType Type="Directory">
+              <desktop5:Verb Id="Nothing" Clsid="b3d99d91-bb3e-4ba8-aeef-421b590d8957" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type="Directory\Background">
+              <desktop5:Verb Id="Nothing" Clsid="b3d99d91-bb3e-4ba8-aeef-421b590d8957" />
+            </desktop5:ItemType>
+          </desktop4:FileExplorerContextMenus>
+        </desktop4:Extension>
+        <!-- SurrogateServer is the documented element, but Explorer loads context-menu
+             handlers in-process; Path is relative to the external location. -->
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:SurrogateServer DisplayName="Nothing context menu">
+              <com:Class Id="b3d99d91-bb3e-4ba8-aeef-421b590d8957" Path="nothing_shell.dll" ThreadingModel="STA" />
+            </com:SurrogateServer>
+          </com:ComServer>
+        </com:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>
