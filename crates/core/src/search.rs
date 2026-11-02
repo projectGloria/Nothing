@@ -6,6 +6,8 @@
 //!   `*.mkv` `a?c`  wildcards, whole-name match
 //!   `\` in a term  match against the full path instead of the name
 //!   `ext:jpg;png`  `file:` `folder:` `case:` `path:`   modifiers, stackable (`case:path:Foo`)
+//!   `!video`       file type: `!` + a name from `TYPES` is an extension set, not a NOT.
+//!                  `!"video"` (any quote) keeps the old meaning: exclude names with "video".
 //!
 //! Execution: every live entry is tested on all cores into a bitset, then the presorted
 //! permutation for the requested column is walked and filtered by that bitset. Sorting a
@@ -58,7 +60,23 @@ pub struct Query {
     path_slots: usize,
 }
 
-fn tokenize(s: &str) -> Vec<String> {
+/// `!<name>` file-type macros. Exact, case-insensitive token match only, so `!videos` or
+/// `!vid` are still plain NOT terms — the collision with NOT is limited to these words.
+const TYPES: &[(&[&str], &[&str])] = &[
+    (&["video"], &["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "m2ts", "mts", "ts", "3gp", "vob", "ogv", "divx", "rm", "rmvb", "asf", "f4v"]),
+    (&["audio", "music"], &["mp3", "flac", "wav", "aac", "ogg", "oga", "opus", "m4a", "wma", "aiff", "aif", "ape", "mid", "midi", "amr", "mka", "alac"]),
+    (&["image", "pic"], &["jpg", "jpeg", "jfif", "png", "gif", "bmp", "webp", "tif", "tiff", "heic", "heif", "avif", "svg", "ico", "psd", "raw", "cr2", "nef", "arw", "dng"]),
+    (&["doc"], &["pdf", "doc", "docx", "odt", "rtf", "txt", "md", "xls", "xlsx", "ods", "csv", "ppt", "pptx", "odp", "epub"]),
+    (&["archive"], &["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "zst", "lz", "lzma", "cab", "iso"]),
+    (&["exe"], &["exe", "msi", "bat", "cmd", "com", "ps1", "scr", "appx", "msix"]),
+];
+
+fn file_type(name: &str) -> Option<&'static [&'static str]> {
+    TYPES.iter().find(|(names, _)| names.iter().any(|n| n.eq_ignore_ascii_case(name))).map(|(_, exts)| *exts)
+}
+
+/// Tokens plus whether any quote appeared in them (quoting opts out of `!type` macros).
+fn tokenize(s: &str) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quoted = false;
@@ -71,22 +89,22 @@ fn tokenize(s: &str) -> Vec<String> {
             }
             '|' if !quoted => {
                 if !cur.is_empty() || had_quote {
-                    out.push(std::mem::take(&mut cur));
+                    out.push((std::mem::take(&mut cur), had_quote));
                 }
                 had_quote = false;
-                out.push("|".into());
+                out.push(("|".into(), false));
             }
             c if c.is_whitespace() && !quoted => {
                 if !cur.is_empty() || had_quote {
-                    out.push(std::mem::take(&mut cur));
+                    out.push((std::mem::take(&mut cur), had_quote));
                 }
                 had_quote = false;
             }
             c => cur.push(c),
         }
     }
-    if !cur.is_empty() {
-        out.push(cur);
+    if !cur.is_empty() || had_quote {
+        out.push((cur, had_quote));
     }
     out
 }
@@ -103,8 +121,8 @@ impl Query {
     pub fn parse(text: &str, opts: u8) -> Query {
         let mut groups: Vec<Vec<Term>> = Vec::new();
         let mut join_next = false;
-        for tok in tokenize(text) {
-            if tok == "|" {
+        for (tok, quoted) in tokenize(text) {
+            if tok == "|" && !quoted {
                 join_next = !groups.is_empty();
                 continue;
             }
@@ -118,12 +136,19 @@ impl Query {
                 pat: Pat::All,
             };
             let mut v: &str = &tok;
+            // Folded extension set, from `ext:` or a `!type` macro.
+            let mut ext: Option<Vec<Vec<u8>>> = None;
+            // Checked before the NOT loop: `!video` must not become neg + "video". Only a
+            // single bang qualifies, so `!!video` stays the (silly) double negation.
+            if let Some(exts) = tok.strip_prefix('!').filter(|_| !quoted).and_then(file_type) {
+                ext = Some(exts.iter().map(|e| e.as_bytes().to_vec()).collect());
+                v = "";
+            }
             while let Some(r) = v.strip_prefix('!') {
                 t.neg = !t.neg;
                 v = r;
             }
-            let mut ext = None;
-            loop {
+            while ext.is_none() {
                 if let Some(r) = strip_prefix_ci(v, "case:") {
                     t.case = true;
                     v = r;
@@ -140,7 +165,7 @@ impl Query {
                     t.only = Only::Folders;
                     v = r;
                 } else if let Some(r) = strip_prefix_ci(v, "ext:") {
-                    ext = Some(r);
+                    ext = Some(r.split([';', ',']).filter(|x| !x.is_empty()).map(|x| fold(x.trim_start_matches('.')).into_bytes()).collect());
                     v = "";
                     break;
                 } else {
@@ -159,7 +184,7 @@ impl Query {
             };
             t.pat = if let Some(e) = ext {
                 t.only = Only::Files;
-                Pat::Ext(e.split([';', ',']).filter(|x| !x.is_empty()).map(|x| fold(x.trim_start_matches('.')).into_bytes()).collect())
+                Pat::Ext(e)
             } else if v.is_empty() {
                 Pat::All
             } else if v.contains(['*', '?']) {
@@ -647,6 +672,22 @@ mod tests {
         assert_eq!(run("\"note pad\""), Vec::<String>::new());
         assert_eq!(run("").len(), 8);
         assert_eq!(run("s"), ["docs", "Users", "Windows"]);
+    }
+
+    #[test]
+    fn file_types() {
+        assert_eq!(run("!doc"), ["a.txt", "B.txt", "z.pdf"]);
+        assert_eq!(run("!DOC"), ["a.txt", "B.txt", "z.pdf"]);
+        assert_eq!(run("!doc b"), ["B.txt"]);
+        assert_eq!(run("b !doc"), ["B.txt"]);
+        assert_eq!(run("!exe | !doc"), ["a.txt", "B.txt", "notepad.exe", "z.pdf"]);
+        assert_eq!(run("!video").len(), 0);
+        // Folders are never typed, even ones named like a file.
+        assert_eq!(run("!doc docs"), Vec::<String>::new());
+        // Not a type name, or quoted: plain NOT as before.
+        assert_eq!(run("!docs").len(), 7);
+        assert_eq!(run("!\"doc\"").len(), 7);
+        assert_eq!(run("!!doc").len(), 1);
     }
 
     #[test]

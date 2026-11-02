@@ -138,6 +138,7 @@ Nothing provides an intuitive, expressive search query syntax tailored for speed
 | `*` and `?` | `*.mkv`, `log_????.txt` | Wildcard matching evaluated against the entire filename |
 | `\` *(Path separator)* | `users\nihil\desktop` | Automatically promotes the term to a full path match |
 | `ext:` | `ext:jpg;png;webp` | Matches files with any of the specified semicolon-separated extensions |
+| `!type` | `!video`, `!video nihil` | Matches files of a type: `video`, `audio` (`music`), `image` (`pic`), `doc`, `archive`, `exe`. Combines with any other term. Quote it (`!"video"`) to exclude the word instead |
 | `file:` / `folder:` | `file:config` / `folder:src` | Restricts search to only files or only directories |
 | `case:` | `case:README` | Enforces case-sensitive search for this term |
 | `path:` | `path:target` | Explicitly matches the term against the complete absolute path |

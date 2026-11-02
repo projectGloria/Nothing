@@ -1385,6 +1385,7 @@ impl App {
                  *.mkv  a?c\twildcards (match the whole name)\n\
                  users\\nihil\\\tany \\ in a term matches the full path\n\
                  ext:jpg;png\tby extension\n\
+                 !video  !doc\tby type: video audio image doc archive exe\n\
                  file:  folder:\tonly files / only folders\n\
                  case:  path:\tper-term match case / match full path\n\n\
                  Enter open · Ctrl+Enter open folder · Ctrl+C copy · Ctrl+Shift+C copy path\n\
