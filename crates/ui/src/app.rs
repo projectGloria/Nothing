@@ -11,11 +11,11 @@ use std::ptr::{null, null_mut};
 use nothing_core::flag;
 use nothing_core::proto::{state, Row, Status};
 use nothing_core::search::{OPT_CASE, OPT_PATH};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::*;
-use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
+use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi, SystemParametersInfoForDpi};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::{
     DefSubclassProc, SetWindowSubclass, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, SHIL_EXTRALARGE, SHIL_JUMBO,
@@ -28,10 +28,12 @@ use crate::ipc::{Cmd, Event, Ipc};
 use crate::settings::Settings;
 use crate::thumbs::{Done, Thumbs};
 use crate::util::{date, from_wide, human_bytes, join_path, loword, rgb, size_kb, thousands, wide};
-use crate::{dark, icons, install, shell};
+use crate::{dark, fit, icons, install, shell};
 
 pub const CLASS: &str = "NothingMainWnd";
 pub const WM_APP_SHOW: u32 = WM_APP + 4;
+/// COPYDATASTRUCT::dwData tag for "search in this folder" (UTF-16 path, no NUL).
+pub const COPYDATA_FOLDER: usize = 0x4E46; // "NF"
 const WM_APP_IPC: u32 = WM_APP + 1;
 const WM_APP_ICON: u32 = WM_APP + 2;
 const WM_APP_TRAY: u32 = WM_APP + 3;
@@ -69,26 +71,6 @@ const ID_CTX_COPY_PATH: u32 = 0x8002;
 const VIEW_NAMES: [&str; 4] = ["&Details", "&Medium Icons", "&Large Icons", "E&xtra Large Icons"];
 const SORT_NAMES: [&str; 4] = ["&Name", "&Path", "&Size", "Date &Modified"];
 
-// Undocumented-but-stable messages used to paint the menu bar in dark mode.
-const WM_UAHDRAWMENU: u32 = 0x0091;
-const WM_UAHDRAWMENUITEM: u32 = 0x0092;
-
-#[repr(C)]
-struct UahMenu {
-    hmenu: HMENU,
-    hdc: HDC,
-    flags: u32,
-}
-
-#[repr(C)]
-struct UahDrawMenuItem {
-    dis: DRAWITEMSTRUCT,
-    um: UahMenu,
-    position: i32,
-    _metrics: [u32; 8],
-    _popup: [u32; 5],
-}
-
 /// One cached result row, pre-formatted for painting.
 struct RowView {
     name: Vec<u16>,
@@ -116,12 +98,23 @@ struct Theme {
     dark: bool,
     fg: u32,
     dim: u32,
+    /// Orange accent: menu bar, column titles, item count and selection details.
+    accent: u32,
     field: u32,
     br_bg: HBRUSH,
     br_field: HBRUSH,
     br_hot: HBRUSH,
     /// Column separators and the header's bottom edge (dark header is painted by us).
     br_line: HBRUSH,
+    /// Selected row in Details view: a dim orange fill with an accent-orange frame.
+    sel: u32,
+    br_sel: HBRUSH,
+    br_accent: HBRUSH,
+    /// Row under the mouse in Details view: half the selection's orange, no frame.
+    hover: u32,
+    br_hover: HBRUSH,
+    /// Caption close button under the mouse: Windows' own red, in every theme.
+    br_close: HBRUSH,
 }
 
 impl Theme {
@@ -136,19 +129,42 @@ impl Theme {
             THEME_BLACK => (rgb(0, 0, 0), rgb(220, 220, 220), rgb(140, 140, 140), rgb(0, 0, 0), rgb(40, 40, 40), rgb(34, 34, 34)),
             _ => (rgb(243, 243, 243), rgb(20, 20, 20), rgb(96, 96, 96), rgb(255, 255, 255), rgb(222, 222, 222), rgb(220, 220, 220)),
         };
+        // Bright orange reads well on near-black; on white it needs to be a few steps
+        // darker or it fails contrast (#FF8C00 on white is ~2.3:1, #C25E00 is ~4.6:1).
+        let accent = if kind == THEME_LIGHT { rgb(194, 94, 0) } else { rgb(255, 150, 40) };
+        // Selection fill = accent mixed into the list background: dark enough on dark
+        // themes that white row text stays readable (~25% orange), a light peach on white.
+        let sel = mix(accent, field, if kind == THEME_LIGHT { 18 } else { 25 });
+        // Hover sits between plain and selected (25 / 18): obvious, but the selection
+        // still wins by fill and by its frame.
+        let hover = mix(accent, field, if kind == THEME_LIGHT { 12 } else { 18 });
         unsafe {
             Theme {
                 dark: kind != THEME_LIGHT,
                 fg,
                 dim,
+                accent,
                 field,
                 br_bg: CreateSolidBrush(bg),
                 br_field: CreateSolidBrush(field),
                 br_hot: CreateSolidBrush(hot),
                 br_line: CreateSolidBrush(line),
+                sel,
+                br_sel: CreateSolidBrush(sel),
+                br_accent: CreateSolidBrush(accent),
+                hover,
+                br_hover: CreateSolidBrush(hover),
+                br_close: CreateSolidBrush(rgb(196, 43, 28)),
             }
         }
     }
+}
+
+/// `pct`% of colour `a` over colour `b`, per channel (COLORREF 0x00BBGGRR).
+fn mix(a: u32, b: u32, pct: u32) -> u32 {
+    let ch = |c: u32, sh: u32| (c >> sh) & 0xFF;
+    let m = |sh: u32| (ch(a, sh) * pct + ch(b, sh) * (100 - pct)) / 100;
+    m(0) | m(8) << 8 | m(16) << 16
 }
 
 impl Drop for Theme {
@@ -158,6 +174,10 @@ impl Drop for Theme {
             DeleteObject(self.br_field as _);
             DeleteObject(self.br_hot as _);
             DeleteObject(self.br_line as _);
+            DeleteObject(self.br_sel as _);
+            DeleteObject(self.br_accent as _);
+            DeleteObject(self.br_hover as _);
+            DeleteObject(self.br_close as _);
         }
     }
 }
@@ -195,6 +215,18 @@ pub struct App {
     taskbar_created: u32,
     hotkey_ok: bool,
     offline_note: String,
+    /// Status-bar details for a single selection. Built on selection change, not in
+    /// paint: the type name costs a shell call.
+    detail: Option<Detail>,
+    /// Caption button under the mouse / held down (HT* codes, 0 = none).
+    cap_hot: u32,
+    cap_down: u32,
+    active: bool,
+    small_icon: HICON,
+    /// Segoe MDL2 Assets at caption-glyph size, per DPI.
+    glyphs: HFONT,
+    /// Details row under the mouse (-1 = none), tracked in `list_proc`.
+    hover_row: i32,
 }
 
 thread_local! {
@@ -282,19 +314,19 @@ fn check_radios(m: HMENU, s: &Settings) {
     radio(m, ID_SORT_DESC, s.desc);
 }
 
+/// The caption's menu button pops this up. One menu instead of a bar: the File items at
+/// the top level, the rest of what the old bar had as submenus, so nothing lost its only
+/// way in (Install / Repair and the theme picker live nowhere else).
 fn build_menu() -> HMENU {
     unsafe {
-        let bar = CreateMenu();
-        let file = CreatePopupMenu();
-        add(file, ID_OPEN, "&Open\tEnter");
-        add(file, ID_REVEAL, "Open &Path\tCtrl+Enter");
-        sep(file);
-        add(file, ID_EXIT, "E&xit");
-        let edit = CreatePopupMenu();
-        add(edit, ID_COPY, "&Copy\tCtrl+C");
-        add(edit, ID_COPY_PATH, "Copy &Full Path\tCtrl+Shift+C");
-        sep(edit);
-        add(edit, ID_SELECT_ALL, "Select &All\tCtrl+A");
+        let bar = CreatePopupMenu();
+        add(bar, ID_OPEN, "&Open\tEnter");
+        add(bar, ID_REVEAL, "Open &Path\tCtrl+Enter");
+        sep(bar);
+        add(bar, ID_COPY, "&Copy\tCtrl+C");
+        add(bar, ID_COPY_PATH, "Copy &Full Path\tCtrl+Shift+C");
+        add(bar, ID_SELECT_ALL, "Select &All\tCtrl+A");
+        sep(bar);
         let search = CreatePopupMenu();
         add(search, ID_CASE, "Match &Case\tCtrl+I");
         add(search, ID_PATH, "Match &Path\tCtrl+U");
@@ -315,15 +347,18 @@ fn build_menu() -> HMENU {
         let help = CreatePopupMenu();
         add(help, ID_SYNTAX, "Search &Syntax");
         add(help, ID_ABOUT, "&About Nothing");
-        for (m, t) in [(file, "&File"), (edit, "&Edit"), (view, "&View"), (search, "&Search"), (tools, "&Tools"), (help, "&Help")] {
+        for (m, t) in [(view, "&View"), (search, "&Search"), (tools, "&Tools"), (help, "&Help")] {
             sub(bar, m, t);
         }
+        sep(bar);
+        add(bar, ID_EXIT, "E&xit");
         bar
     }
 }
 
 /// Create the window and run the message loop. Returns the exit code.
-pub fn run(start_hidden: bool) -> i32 {
+/// `folder`: from Explorer's "Nothing" verb (`--folder`), search inside it once shown.
+pub fn run(start_hidden: bool, folder: Option<String>) -> i32 {
     unsafe {
         let hinst = GetModuleHandleW(null());
         let icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES };
@@ -360,7 +395,7 @@ pub fn run(start_hidden: bool) -> i32 {
             settings.w,
             settings.h,
             null_mut(),
-            menu,
+            null_mut(), // no menu bar: the caption's menu button pops up `menu`
             hinst,
             null(),
         );
@@ -404,8 +439,15 @@ pub fn run(start_hidden: bool) -> i32 {
             hinst,
             null(),
         );
-        let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP;
+        // No LVS_EX_LABELTIP: no white "full text" tooltip on hover (the status bar shows
+        // the selection's details). The list also keeps a tooltip control of its own for
+        // truncated labels, so that one is switched off too.
+        let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER;
         SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as usize, ex as isize);
+        let tips = SendMessageW(list, LVM_GETTOOLTIPS, 0, 0) as HWND;
+        if !tips.is_null() {
+            SendMessageW(tips, TTM_ACTIVATE, 0, 0);
+        }
         SendMessageW(list, LVM_SETCALLBACKMASK, 0, 0);
         let header = SendMessageW(list, LVM_GETHEADER, 0, 0) as HWND;
         SetWindowSubclass(list, Some(list_proc), 1, 0);
@@ -445,6 +487,13 @@ pub fn run(start_hidden: bool) -> i32 {
             taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
             hotkey_ok: false,
             offline_note: String::new(),
+            detail: None,
+            cap_hot: 0,
+            cap_down: 0,
+            active: true,
+            small_icon: null_mut(),
+            glyphs: null_mut(),
+            hover_row: -1,
         });
         APP.with(|a| a.set(Box::into_raw(boxed)));
         let a = app().unwrap();
@@ -479,6 +528,9 @@ pub fn run(start_hidden: bool) -> i32 {
             if a.settings.maximized {
                 ShowWindow(hwnd, SW_MAXIMIZE);
             }
+        }
+        if let Some(f) = folder {
+            a.open_folder(&f);
         }
 
         let mut msg: MSG = std::mem::zeroed();
@@ -583,6 +635,8 @@ impl App {
         if n > 0 {
             unsafe { SendMessageW(self.list, LVM_REDRAWITEMS, first as usize, (first + n - 1) as isize) };
         }
+        // The selected row may just have arrived, or been replaced by a refresh.
+        self.update_detail();
     }
 
     fn on_ipc(&mut self, ev: Event) {
@@ -676,7 +730,7 @@ impl App {
             let line_h = self.edit_line_height().min(edit_h - 2);
             let y = f.top + (edit_h - line_h) / 2;
             MoveWindow(self.edit, f.left + inset, y, (f.right - f.left - 2 * inset).max(0), line_h, 1);
-            let top = edit_h + 2 * pad;
+            let top = self.caption_h() + edit_h + 2 * pad;
             MoveWindow(self.list, 0, top, w, (h - top - status_h).max(0), 1);
             self.invalidate_status();
         }
@@ -687,7 +741,8 @@ impl App {
         let mut rc: RECT = unsafe { std::mem::zeroed() };
         unsafe { GetClientRect(self.hwnd, &mut rc) };
         let (pad, edit_h, _) = self.metrics();
-        RECT { left: pad, top: pad, right: rc.right - pad, bottom: pad + edit_h }
+        let top = self.caption_h() + pad;
+        RECT { left: pad, top, right: rc.right - pad, bottom: top + edit_h }
     }
 
     /// Height of one line in the current font, i.e. what the EDIT actually needs.
@@ -719,11 +774,38 @@ impl App {
         unsafe { SendMessageW(self.list, LVM_GETSELECTEDCOUNT, 0, 0) as u32 }
     }
 
-    fn status_texts(&self) -> (String, String) {
-        let mut left = format!("{} {}", thousands(self.total as u64), if self.total == 1 { "item" } else { "items" });
+    /// Rebuild the single-selection details if the selection moved to another row (or the
+    /// row behind an index changed after a refresh). Cheap when nothing changed.
+    fn update_detail(&mut self) {
+        let i = if self.selected_count() == 1 { unsafe { SendMessageW(self.list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize) as i32 } } else { -1 };
+        let Some(r) = (i >= 0).then(|| self.rows.get(&(i as u32))).flatten() else {
+            // Nothing selected, several selected, or the row isn't fetched yet (store_rows
+            // calls back here once it is).
+            if self.detail.take().is_some() {
+                self.invalidate_status();
+            }
+            return;
+        };
+        if self.detail.as_ref().is_some_and(|d| d.idx == i as u32 && d.full == r.full) {
+            return;
+        }
+        self.detail = Some(describe(i as u32, r));
+        self.invalidate_status();
+    }
+
+    /// (count, rest of the left side, plain right side, single-selection details). The
+    /// count is split out so paint can colour it on its own. Details and the plain right
+    /// side are exclusive: details only when nothing more urgent wants the space.
+    fn status_texts(&self) -> (String, String, String, Option<&Detail>) {
+        let count = format!("{} {}", thousands(self.total as u64), if self.total == 1 { "item" } else { "items" });
+        let mut left = String::new();
         let sel = self.selected_count();
+        let mut detail = None;
         let mut right = String::new();
-        if sel > 0 {
+        if sel == 1 {
+            left.push_str("   ·   1 selected");
+            detail = self.detail.as_ref();
+        } else if sel > 0 {
             left.push_str(&format!("   ·   {} selected", thousands(sel as u64)));
             // Total size of the selection, when every selected row is in the cache.
             if sel <= 5000 {
@@ -752,14 +834,17 @@ impl App {
                 }
             }
         }
+        // Service problems trump selection details.
         if !self.connected {
+            detail = None;
             right = self.offline_note.clone();
         } else if let Some(s) = &self.status {
             if s.state != state::READY {
+                detail = None;
                 right = s.message.clone();
             }
         }
-        (left, right)
+        (count, left, right, detail)
     }
 
     fn paint(&self) {
@@ -769,9 +854,10 @@ impl App {
             let mut rc: RECT = std::mem::zeroed();
             GetClientRect(self.hwnd, &mut rc);
             let (pad, edit_h, _) = self.metrics();
-            // Strip around the search box.
-            let top = RECT { left: 0, top: 0, right: rc.right, bottom: edit_h + 2 * pad };
+            // Caption + strip around the search box: one continuous band.
+            let top = RECT { left: 0, top: 0, right: rc.right, bottom: self.caption_h() + edit_h + 2 * pad };
             FillRect(hdc, &top, self.theme.br_bg);
+            self.paint_caption(hdc);
             // Search field: field-colored box with the same hairline as the column separators.
             // WS_CLIPCHILDREN keeps this from painting over the EDIT itself.
             let f = self.field_rect();
@@ -782,14 +868,58 @@ impl App {
             FillRect(hdc, &sr, self.theme.br_bg);
             let old = SelectObject(hdc, self.font as _);
             SetBkMode(hdc, TRANSPARENT as i32);
-            SetTextColor(hdc, self.theme.fg);
-            let (left, right) = self.status_texts();
-            let mut r = RECT { left: sr.left + scale(8, self.dpi), right: sr.right - scale(10, self.dpi), ..sr };
-            let mut lw = wide(&left);
-            DrawTextW(hdc, lw.as_mut_ptr(), -1, &mut r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            SetTextColor(hdc, self.theme.dim);
-            let mut rw = wide(&right);
-            DrawTextW(hdc, rw.as_mut_ptr(), -1, &mut r, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            let (count, left, right, detail) = self.status_texts();
+            let r = RECT { left: sr.left + scale(8, self.dpi), right: sr.right - scale(10, self.dpi), ..sr };
+            // Draws one run at x, returns where the next one starts. DT_CALCRECT only
+            // measures; the second call paints, vertically centred in the bar.
+            let run = |x: i32, text: &str, color: u32| {
+                let mut w = wide(text);
+                let mut m = RECT { left: x, ..r };
+                DrawTextW(hdc, w.as_mut_ptr(), -1, &mut m, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+                let mut d = RECT { left: x, ..r };
+                SetTextColor(hdc, color);
+                DrawTextW(hdc, w.as_mut_ptr(), -1, &mut d, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                m.right
+            };
+            // Left: orange count, then the selection info in fg.
+            let x = run(r.left, &count, self.theme.accent);
+            let x = run(x, &left, self.theme.fg);
+            // Right side gets only what's left, so it can't overprint the count.
+            let avail = RECT { left: x + scale(24, self.dpi), ..r };
+            if let Some(d) = detail {
+                // name · folder · type · size: fields orange, dots in fg. Each field is
+                // trimmed on its own (fit.rs): C:\Users\Nihil\Downloads\Chernobyl.. instead
+                // of one ellipsis eating whatever happens to be at the end.
+                const SEP: &str = "   ·   ";
+                let measure = |s: &str| text_width(hdc, s);
+                let (head, tail) = fit::fields(&d.name, &d.folder, &d.kind, &d.size, avail.right - avail.left, SEP, &measure);
+                let width = |v: &[String]| v.iter().map(|p| measure(p)).sum::<i32>() + measure(SEP) * (v.len() as i32 - 1).max(0);
+                let draw = |mut x: i32, v: &[String]| {
+                    for (k, p) in v.iter().enumerate() {
+                        if k > 0 {
+                            x = run(x, SEP, self.theme.fg);
+                        }
+                        x = run(x, p, self.theme.accent);
+                    }
+                };
+                // Type and size stay right-aligned; name and folder are centred on the
+                // whole bar, slid sideways only as far as needed to clear the count on
+                // the left and keep one separator's gap before the type. fields() budgeted
+                // that separator, so both clamps can hold unless nothing fit at all.
+                let tail_x = avail.right - width(&tail);
+                let hw = width(&head);
+                let hi = if tail.is_empty() { avail.right } else { tail_x - measure(SEP) } - hw;
+                let x = ((sr.left + sr.right - hw) / 2).min(hi).max(avail.left);
+                draw(x, &head);
+                if x <= hi {
+                    draw(tail_x, &tail);
+                }
+            } else {
+                SetTextColor(hdc, self.theme.dim);
+                let mut rw = wide(&right);
+                let mut rr = avail;
+                DrawTextW(hdc, rw.as_mut_ptr(), -1, &mut rr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            }
             SelectObject(hdc, old);
             EndPaint(self.hwnd, &ps);
         }
@@ -800,6 +930,18 @@ impl App {
         let old = self.font;
         self.font = make_font(dpi);
         unsafe {
+            let (g, ic) = (self.glyphs, self.small_icon);
+            self.glyphs = CreateFontW(-scale(10, dpi), 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, DEFAULT_CHARSET as _, OUT_DEFAULT_PRECIS as _, CLIP_DEFAULT_PRECIS as _, CLEARTYPE_QUALITY as _, DEFAULT_PITCH as _, wide("Segoe MDL2 Assets").as_ptr());
+            // Loaded at the exact small-icon size for this DPI: LR_SHARED would hand back
+            // whatever size was cached first.
+            let sz = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+            self.small_icon = LoadImageW(GetModuleHandleW(null()), 1 as _, IMAGE_ICON, sz, sz, 0) as HICON;
+            if !g.is_null() {
+                DeleteObject(g as _);
+            }
+            if !ic.is_null() {
+                DestroyIcon(ic);
+            }
             SendMessageW(self.edit, WM_SETFONT, self.font as usize, 1);
             SendMessageW(self.list, WM_SETFONT, self.font as usize, 1);
             if !old.is_null() {
@@ -840,10 +982,10 @@ impl App {
             for h in [self.list, self.header, self.edit] {
                 SendMessageW(h, WM_THEMECHANGED, 0, 0);
             }
-            // Frame + menu bar: SWP_FRAMECHANGED forces a fresh WM_NCPAINT, so the bar is
-            // repainted via WM_UAHDRAWMENU (dark) or the default path (light) right away.
+            // SWP_FRAMECHANGED re-runs WM_NCCALCSIZE: on the first call this is what takes
+            // the native title bar away (the one inside CreateWindowEx came before the
+            // window was shown, which some frame state ignores).
             SetWindowPos(self.hwnd, null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-            DrawMenuBar(self.hwnd);
             RedrawWindow(self.hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
         }
     }
@@ -1133,6 +1275,16 @@ impl App {
         }
     }
 
+    /// Open the row's folder in Explorer with the row itself selected.
+    fn reveal_row(&mut self, i: u32) {
+        if !self.rows.contains_key(&i) {
+            self.fetch_sync(&[i]);
+        }
+        if let Some(r) = self.rows.get(&i) {
+            shell::reveal(&r.full);
+        }
+    }
+
     fn reveal_selected(&mut self) {
         if let Some(p) = self.focused_or_first_selected() {
             shell::reveal(&p);
@@ -1170,6 +1322,29 @@ impl App {
                 SendMessageW(self.list, LVM_SETITEMSTATE, 0, &st as *const _ as isize);
                 SendMessageW(self.list, LVM_ENSUREVISIBLE, 0, 0);
             }
+        }
+    }
+
+    /// Show the window searching inside `dir`: the query becomes the quoted folder path
+    /// with a trailing backslash. A term containing `\` matches the full path, so that
+    /// alone lists everything below the folder (not the folder itself), and the caret
+    /// sits after it so typing narrows inside the folder.
+    fn open_folder(&mut self, dir: &str) {
+        // Explorer quotes %1, and `"C:\"` reaches argv as `C:"` (backslash-quote is an
+        // escaped quote to the CRT), so strip stray quotes before normalising.
+        let mut d = dir.trim().trim_matches('"').to_string();
+        if !d.ends_with('\\') {
+            d.push('\\');
+        }
+        self.show();
+        unsafe {
+            // SetWindowText fires EN_CHANGE, which runs the query.
+            SetWindowTextW(self.edit, wide(&format!("\"{d}\" ")).as_ptr());
+            SetFocus(self.edit);
+            // Caret at the end. Not a "huge" start: EM_SETSEL truncates it to -1, which
+            // means "remove the selection" and leaves the caret at 0.
+            let n = GetWindowTextLengthW(self.edit) as usize;
+            SendMessageW(self.edit, EM_SETSEL, n, n as isize);
         }
     }
 
@@ -1453,10 +1628,18 @@ impl App {
                 }
                 LVN_ODFINDITEMW => Some(-1),
                 // Details view never gets past the guard: it keeps the stock paint path.
-                NM_CUSTOMDRAW if self.thumbs.active() => Some(self.custom_draw(&mut *(lp as *mut NMLVCUSTOMDRAW))),
+                // Details: orange selection. Icon views: thumbnails (they keep the stock
+                // selection; there the highlight is drawn around icon and label separately,
+                // which custom draw can't recolour as one box).
+                NM_CUSTOMDRAW if self.thumbs.active() || self.settings.view == VIEW_DETAILS => Some(self.custom_draw(&mut *(lp as *mut NMLVCUSTOMDRAW))),
                 NM_DBLCLK => {
                     let ia = &*(lp as *const NMITEMACTIVATE);
-                    if ia.iItem >= 0 {
+                    // The ListView hit-tests the sub-item for us in report view, so a
+                    // double-click on the Path cell means "take me there", not "run it".
+                    // Icon views always report sub-item 0 and keep the open behaviour.
+                    if ia.iItem >= 0 && ia.iSubItem == 1 && self.settings.view == VIEW_DETAILS {
+                        self.reveal_row(ia.iItem as u32);
+                    } else if ia.iItem >= 0 {
                         self.open_selected();
                     }
                     Some(0)
@@ -1472,6 +1655,7 @@ impl App {
                     Some(0)
                 }
                 LVN_ITEMCHANGED | LVN_ODSTATECHANGED => {
+                    self.update_detail();
                     self.invalidate_status();
                     None
                 }
@@ -1483,11 +1667,48 @@ impl App {
     // ---- thumbnails ---------------------------------------------------------------------
 
     fn custom_draw(&mut self, cd: &mut NMLVCUSTOMDRAW) -> LRESULT {
+        let details = self.settings.view == VIEW_DETAILS;
         match cd.nmcd.dwDrawStage {
             // Once per paint pass: cheap to re-aim the worker queue at what's on screen.
             CDDS_PREPAINT => {
-                self.schedule_thumbs();
+                if self.thumbs.active() {
+                    self.schedule_thumbs();
+                }
                 CDRF_NOTIFYITEMDRAW as LRESULT
+            }
+            CDDS_ITEMPREPAINT if details => {
+                let i = cd.nmcd.dwItemSpec;
+                // Ask the list, not uItemState: an owner-data list doesn't reliably set
+                // CDIS_SELECTED there, and the theme decides from the real state anyway.
+                let selected = unsafe { SendMessageW(self.list, LVM_GETITEMSTATE, i, LVIS_SELECTED as isize) } != 0;
+                if !selected {
+                    // Hover: same trick with a fainter orange instead of the theme's blue
+                    // hot box. Our own hover_row, because an owner-data list reports
+                    // neither CDIS_HOT nor LVM_GETHOTITEM (that one needs track-select).
+                    if i as i32 != self.hover_row {
+                        return CDRF_DODEFAULT as LRESULT;
+                    }
+                    let rc = self.row_rect(i);
+                    unsafe { FillRect(cd.nmcd.hdc, &rc, self.theme.br_hover) };
+                    cd.nmcd.uItemState &= !CDIS_HOT;
+                    cd.clrTextBk = self.theme.hover;
+                    return CDRF_NEWFONT as LRESULT;
+                }
+                // Fill the whole row ourselves (clrTextBk alone leaves the icon cell
+                // unpainted), then clear the state bits so the visual style doesn't lay
+                // its blue selection / hover box over it. Text is then drawn on clrTextBk.
+                let rc = self.row_rect(i);
+                unsafe { FillRect(cd.nmcd.hdc, &rc, self.theme.br_sel) };
+                cd.nmcd.uItemState &= !(CDIS_SELECTED | CDIS_FOCUS | CDIS_HOT);
+                cd.clrText = self.theme.fg;
+                cd.clrTextBk = self.theme.sel;
+                (CDRF_NEWFONT | CDRF_NOTIFYPOSTPAINT) as LRESULT
+            }
+            CDDS_ITEMPOSTPAINT if details => {
+                // Only selected rows asked for post-paint: frame them in accent orange.
+                let rc = self.row_rect(cd.nmcd.dwItemSpec);
+                unsafe { FrameRect(cd.nmcd.hdc, &rc, self.theme.br_accent) };
+                CDRF_DODEFAULT as LRESULT
             }
             CDDS_ITEMPREPAINT => {
                 let i = cd.nmcd.dwItemSpec as u32;
@@ -1506,6 +1727,13 @@ impl App {
             }
             _ => CDRF_DODEFAULT as LRESULT,
         }
+    }
+
+    /// A Details row's full width, as the selection box should cover it.
+    fn row_rect(&self, i: usize) -> RECT {
+        let mut rc = RECT { left: LVIR_BOUNDS as i32, top: 0, right: 0, bottom: 0 };
+        unsafe { SendMessageW(self.list, LVM_GETITEMRECT, i, &mut rc as *mut _ as isize) };
+        rc
     }
 
     /// Rows currently on screen in an icon view. LVM_GETTOPINDEX / GETCOUNTPERPAGE are
@@ -1629,65 +1857,200 @@ impl App {
         }
     }
 
-    // ---- dark menu bar ----------------------------------------------------------------
+    // ---- caption ----------------------------------------------------------------------
+    //
+    // The title bar is ours: WM_NCCALCSIZE hands its strip to the client area (the side
+    // and bottom resize borders, shadow and snap stay native), and WM_NCHITTEST tells
+    // Windows which part of that strip is caption, a button or the top resize edge.
+    // Windows has no supported way to add a button to its own title bar, which is the
+    // only reason for all of this.
 
-    fn uah_draw_bar(&self, lp: LPARAM) {
+    fn caption_h(&self) -> i32 {
+        scale(32, self.dpi)
+    }
+
+    /// Caption buttons left to right, Win11-sized (46 px wide at 96 DPI).
+    fn caption_buttons(&self) -> [(u32, RECT); 4] {
+        let mut rc: RECT = unsafe { std::mem::zeroed() };
+        unsafe { GetClientRect(self.hwnd, &mut rc) };
+        let (bw, h) = (scale(46, self.dpi), self.caption_h());
+        let at = |k: i32| RECT { left: rc.right - k * bw, top: 0, right: rc.right - (k - 1) * bw, bottom: h };
+        [(HTMENU, at(4)), (HTMINBUTTON, at(3)), (HTMAXBUTTON, at(2)), (HTCLOSE, at(1))]
+    }
+
+    fn invalidate_caption(&self) {
+        let mut rc: RECT = unsafe { std::mem::zeroed() };
         unsafe {
-            let um = &*(lp as *const UahMenu);
-            let mut mbi: MENUBARINFO = std::mem::zeroed();
-            mbi.cbSize = std::mem::size_of::<MENUBARINFO>() as u32;
-            GetMenuBarInfo(self.hwnd, OBJID_MENU, 0, &mut mbi);
-            let mut wr: RECT = std::mem::zeroed();
-            GetWindowRect(self.hwnd, &mut wr);
-            let mut r = mbi.rcBar;
-            OffsetRect(&mut r, -wr.left, -wr.top);
-            r.top -= 1; // cover the 1px gap above the bar too
-            FillRect(um.hdc, &r, self.theme.br_bg);
+            GetClientRect(self.hwnd, &mut rc);
+            rc.bottom = self.caption_h();
+            InvalidateRect(self.hwnd, &rc, 0);
         }
     }
 
-    fn uah_draw_item(&self, lp: LPARAM) {
-        unsafe {
-            let it = &*(lp as *const UahDrawMenuItem);
-            let mut buf = [0u16; 128];
-            let mut mii: MENUITEMINFOW = std::mem::zeroed();
-            mii.cbSize = std::mem::size_of::<MENUITEMINFOW>() as u32;
-            mii.fMask = MIIM_STRING;
-            mii.dwTypeData = buf.as_mut_ptr();
-            mii.cch = 127;
-            GetMenuItemInfoW(it.um.hmenu, it.position as u32, 1, &mut mii);
-            let st = it.dis.itemState;
-            let hot = st & (ODS_HOTLIGHT | ODS_SELECTED) != 0;
-            FillRect(it.um.hdc, &it.dis.rcItem, if hot { self.theme.br_hot } else { self.theme.br_bg });
-            SetBkMode(it.um.hdc, TRANSPARENT as i32);
-            SetTextColor(it.um.hdc, if st & (ODS_GRAYED | ODS_DISABLED) != 0 { self.theme.dim } else { self.theme.fg });
-            let mut r = it.dis.rcItem;
-            let flags = DT_CENTER | DT_SINGLELINE | DT_VCENTER | if st & ODS_NOACCEL != 0 { DT_HIDEPREFIX } else { 0 };
-            DrawTextW(it.um.hdc, buf.as_mut_ptr(), -1, &mut r, flags);
+    /// Hit code for a point (client coordinates) that DefWindowProc called client area.
+    /// HTMAXBUTTON matters beyond our own clicks: it's what makes Windows 11 show the
+    /// snap layouts flyout on hover.
+    fn caption_hit(&self, pt: POINT) -> u32 {
+        if pt.y >= self.caption_h() {
+            return HTCLIENT;
         }
+        unsafe {
+            // No top border any more, so the top resize edge lives inside the caption.
+            if IsZoomed(self.hwnd) == 0 && pt.y < GetSystemMetricsForDpi(SM_CYSIZEFRAME, self.dpi) {
+                let mut rc: RECT = std::mem::zeroed();
+                GetClientRect(self.hwnd, &mut rc);
+                let corner = scale(16, self.dpi);
+                return if pt.x < corner {
+                    HTTOPLEFT
+                } else if pt.x >= rc.right - corner {
+                    HTTOPRIGHT
+                } else {
+                    HTTOP
+                };
+            }
+        }
+        self.caption_buttons().iter().find(|(_, r)| unsafe { PtInRect(r, pt) } != 0).map_or(HTCAPTION, |b| b.0)
     }
 
-    /// The non-client area paints a light 1px line under the menu bar; paint over it.
-    fn uah_fix_line(&self) {
+    fn set_caption_hot(&mut self, ht: u32) {
+        let ht = if is_caption_button(ht) { ht } else { 0 };
+        if ht == self.cap_hot {
+            return;
+        }
+        self.cap_hot = ht;
+        if ht != 0 {
+            // Non-client hover has no WM_MOUSELEAVE of its own; ask for WM_NCMOUSELEAVE.
+            let mut t = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE | TME_NONCLIENT, hwndTrack: self.hwnd, dwHoverTime: 0 };
+            unsafe { TrackMouseEvent(&mut t) };
+        }
+        self.invalidate_caption();
+    }
+
+    /// Button press. DefWindowProc never sees it: its own handling would run the
+    /// Windows 95 button-tracking loop and paint a classic button over ours.
+    fn caption_press(&mut self, ht: u32) {
+        if ht == HTMENU {
+            self.caption_menu();
+            return;
+        }
+        self.cap_down = ht;
+        self.invalidate_caption();
+    }
+
+    /// Button release: acts only if it lands on the button that was pressed, like a
+    /// real button (press, slide off, release = nothing).
+    fn caption_release(&mut self, ht: u32) {
+        let down = std::mem::take(&mut self.cap_down);
+        self.invalidate_caption();
+        if down != ht {
+            return;
+        }
+        let sc = match ht {
+            HTMINBUTTON => SC_MINIMIZE,
+            HTMAXBUTTON if unsafe { IsZoomed(self.hwnd) } != 0 => SC_RESTORE,
+            HTMAXBUTTON => SC_MAXIMIZE,
+            HTCLOSE => SC_CLOSE, // WM_CLOSE: hides to the tray, same as before
+            _ => return,         // HTMENU acts on press, never here
+        };
+        self.cap_hot = 0;
+        unsafe { PostMessageW(self.hwnd, WM_SYSCOMMAND, sc as usize, 0) };
+    }
+
+    /// The menu button's popup, dropped from the button's bottom-right corner. Also
+    /// what Alt / F10 open, now that there is no menu bar for them to activate.
+    fn caption_menu(&mut self) {
+        let mut r = self.caption_buttons()[0].1;
+        self.cap_down = HTMENU;
+        self.cap_hot = HTMENU;
+        self.invalidate_caption();
+        // UpdateWindow and the menu loop re-enter wndproc, which reaches this App through
+        // a second &mut from app(). The optimizer assumes &mut self is exclusive, so in
+        // release it sank the two stores above past those calls and then dropped them as
+        // dead (overwritten with 0 below): the paint saw "not pressed". black_box makes
+        // self escape here, forcing the stores out first and fresh loads afterwards.
+        std::hint::black_box(&mut *self);
         unsafe {
-            let mut cr: RECT = std::mem::zeroed();
-            GetClientRect(self.hwnd, &mut cr);
-            let mut pts = [POINT { x: cr.left, y: cr.top }, POINT { x: cr.right, y: cr.bottom }];
+            UpdateWindow(self.hwnd); // show the pressed state before the modal loop starts
+            let mut pts = [POINT { x: r.left, y: r.top }, POINT { x: r.right, y: r.bottom }];
             MapWindowPoints(self.hwnd, null_mut(), pts.as_mut_ptr(), 2);
-            let mut wr: RECT = std::mem::zeroed();
-            GetWindowRect(self.hwnd, &mut wr);
-            let line = RECT { left: pts[0].x - wr.left, right: pts[1].x - wr.left, top: pts[0].y - wr.top - 1, bottom: pts[0].y - wr.top };
-            let dc = GetWindowDC(self.hwnd);
-            FillRect(dc, &line, self.theme.br_bg);
-            ReleaseDC(self.hwnd, dc);
+            r = RECT { left: pts[0].x, top: pts[0].y, right: pts[1].x, bottom: pts[1].y };
+            let tpm = TPMPARAMS { cbSize: std::mem::size_of::<TPMPARAMS>() as u32, rcExclude: r };
+            let cmd = TrackPopupMenuEx(self.menu, TPM_RETURNCMD | TPM_RIGHTALIGN | TPM_TOPALIGN | TPM_VERTICAL, r.right, r.bottom, self.hwnd, &tpm);
+            std::hint::black_box(&mut *self);
+            self.cap_down = 0;
+            self.cap_hot = 0;
+            self.invalidate_caption();
+            if cmd > 0 {
+                self.on_command(cmd as u16);
+            }
         }
     }
+
+    /// Icon, title and the four buttons. The background is already filled by `paint`.
+    fn paint_caption(&self, hdc: HDC) {
+        let h = self.caption_h();
+        let buttons = self.caption_buttons();
+        let text = if self.active { self.theme.fg } else { self.theme.dim };
+        unsafe {
+            let ic = GetSystemMetricsForDpi(SM_CXSMICON, self.dpi);
+            DrawIconEx(hdc, scale(10, self.dpi), (h - ic) / 2, self.small_icon, ic, ic, 0, null_mut(), DI_NORMAL);
+            let old = SelectObject(hdc, self.font as _);
+            SetBkMode(hdc, TRANSPARENT as i32);
+            SetTextColor(hdc, text);
+            let mut t = wide("Nothing");
+            let mut r = RECT { left: scale(10, self.dpi) + ic + scale(8, self.dpi), top: 0, right: buttons[0].1.left, bottom: h };
+            DrawTextW(hdc, t.as_mut_ptr(), -1, &mut r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            // Segoe MDL2 Assets: the glyph font Windows draws its own caption buttons with
+            // (present on 10 and 11, unlike Segoe Fluent Icons).
+            SelectObject(hdc, self.glyphs as _);
+            for (ht, rc) in buttons {
+                let hot = self.cap_hot == ht;
+                if hot || self.cap_down == ht {
+                    FillRect(hdc, &rc, if ht == HTCLOSE { self.theme.br_close } else { self.theme.br_hot });
+                }
+                let glyph = match ht {
+                    HTMENU => '\u{E700}', // GlobalNavButton (hamburger)
+                    HTMINBUTTON => '\u{E921}',
+                    HTMAXBUTTON if IsZoomed(self.hwnd) != 0 => '\u{E923}', // restore
+                    HTMAXBUTTON => '\u{E922}',
+                    _ => '\u{E8BB}',
+                };
+                SetTextColor(hdc, match ht {
+                    HTCLOSE if hot => rgb(255, 255, 255),
+                    HTMENU => self.theme.accent,
+                    _ => text,
+                });
+                let mut g = wide(&glyph.to_string());
+                let mut gr = rc;
+                DrawTextW(hdc, g.as_mut_ptr(), -1, &mut gr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            }
+            SelectObject(hdc, old);
+        }
+    }
+}
+
+fn is_caption_button(ht: u32) -> bool {
+    matches!(ht, HTMENU | HTMINBUTTON | HTMAXBUTTON | HTCLOSE)
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     // While a shell context menu is open, its owner-drawn submenus need these messages.
     if matches!(msg, WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR) {
         if let Some(r) = shell::forward_menu_msg(msg, wp, lp) {
+            return r;
+        }
+    }
+    // Caption strip -> client area: DefWindowProc lays out the standard frame, then the
+    // top goes back to the window's top edge. Ahead of the App check because it first
+    // runs inside CreateWindowEx.
+    if msg == WM_NCCALCSIZE && wp != 0 {
+        unsafe {
+            let p = &mut *(lp as *mut NCCALCSIZE_PARAMS);
+            let (top, left) = (p.rgrc[0].top, p.rgrc[0].left);
+            let r = DefWindowProcW(hwnd, msg, wp, lp);
+            // A maximized window hangs its borders off-screen on every side; inset the top
+            // by the same amount or the caption would start above the monitor.
+            p.rgrc[0].top = top + if IsZoomed(hwnd) != 0 { p.rgrc[0].left - left } else { 0 };
             return r;
         }
     }
@@ -1781,6 +2144,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 a.show();
                 0
             }
+            // A second nothing.exe launched by the folder verb hands its folder over.
+            WM_COPYDATA => {
+                let cds = &*(lp as *const windows_sys::Win32::System::DataExchange::COPYDATASTRUCT);
+                if cds.dwData == COPYDATA_FOLDER && !cds.lpData.is_null() {
+                    let units = std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2);
+                    a.open_folder(&String::from_utf16_lossy(units));
+                }
+                1
+            }
             WM_HOTKEY => {
                 a.toggle();
                 0
@@ -1833,18 +2205,45 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
-            WM_UAHDRAWMENU if a.theme.dark => {
-                a.uah_draw_bar(lp);
-                1
-            }
-            WM_UAHDRAWMENUITEM if a.theme.dark => {
-                a.uah_draw_item(lp);
-                1
-            }
-            WM_NCPAINT | WM_NCACTIVATE if a.theme.dark => {
+            WM_NCHITTEST => {
                 let r = DefWindowProcW(hwnd, msg, wp, lp);
-                a.uah_fix_line();
-                r
+                if r as u32 != HTCLIENT {
+                    return r; // side / bottom borders
+                }
+                let mut pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
+                ScreenToClient(hwnd, &mut pt);
+                a.caption_hit(pt) as LRESULT
+            }
+            WM_NCMOUSEMOVE => {
+                a.set_caption_hot(wp as u32);
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            // Also fires as the menu's modal loop grabs the mouse: keep the menu button
+            // lit while its popup is open (caption_menu clears it afterwards).
+            WM_NCMOUSELEAVE if a.cap_down != HTMENU => {
+                a.cap_down = 0;
+                a.set_caption_hot(0);
+                0
+            }
+            WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK if is_caption_button(wp as u32) => {
+                a.caption_press(wp as u32);
+                0
+            }
+            WM_NCLBUTTONUP if is_caption_button(wp as u32) => {
+                a.caption_release(wp as u32);
+                0
+            }
+            WM_NCACTIVATE => {
+                a.active = wp != 0;
+                a.invalidate_caption();
+                // lParam -1: don't repaint the (now nonexistent) non-client caption.
+                DefWindowProcW(hwnd, msg, wp, -1)
+            }
+            // Alt / F10 with no menu bar: open the caption menu instead. Alt+Space
+            // (lParam ' ') still reaches the system menu.
+            WM_SYSCOMMAND if (wp & 0xFFF0) as u32 == SC_KEYMENU && lp == 0 => {
+                a.caption_menu();
+                0
             }
             m if m == a.taskbar_created && m != 0 => {
                 a.add_tray(); // Explorer restarted
@@ -1855,7 +2254,60 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
 }
 
-/// Dark header, painted entirely by us. Custom draw can't do it: DarkMode_ItemsView fills
+/// What the status bar shows for a single selection, unformatted: paint trims each field
+/// to the room it has (see `fit::fields`), which depends on the window width.
+struct Detail {
+    idx: u32,
+    full: String,
+    name: String,
+    folder: String,
+    kind: String,
+    size: String,
+}
+
+/// Size comes from the index; the type is a registry lookup by extension
+/// (SHGFI_USEFILEATTRIBUTES: no disk access), the same name Explorer's Type column shows.
+fn describe(idx: u32, r: &RowView) -> Detail {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
+    use windows_sys::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_TYPENAME, SHGFI_USEFILEATTRIBUTES};
+
+    let mut kind = String::new();
+    unsafe {
+        let mut sfi: SHFILEINFOW = std::mem::zeroed();
+        let attrs = if r.dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL };
+        if SHGetFileInfoW(wide(&r.full).as_ptr(), attrs, &mut sfi, std::mem::size_of::<SHFILEINFOW>() as u32, SHGFI_TYPENAME | SHGFI_USEFILEATTRIBUTES) != 0 {
+            kind = from_wide(&sfi.szTypeName);
+        }
+    }
+    // The type field already says "MKV File", so ".mkv" on the name is the same fact
+    // twice, in the field that's always short on room. Kept when there's no type to
+    // carry it, for folders ("v1.2" is a name, not an extension) and for dotfiles
+    // (".gitignore" would strip to nothing).
+    let mut name = from_wide(&r.name);
+    if !r.dir && !kind.is_empty() {
+        if let Some(i) = name.rfind('.').filter(|&i| i > 0) {
+            name.truncate(i);
+        }
+    }
+    Detail {
+        idx,
+        full: r.full.clone(),
+        name,
+        folder: from_wide(&r.path),
+        kind,
+        size: if r.dir { String::new() } else { human_bytes(r.bytes) },
+    }
+}
+
+/// Pixel width of `s` in the DC's current font.
+fn text_width(hdc: HDC, s: &str) -> i32 {
+    let w: Vec<u16> = s.encode_utf16().collect();
+    let mut sz = SIZE { cx: 0, cy: 0 };
+    unsafe { GetTextExtentPoint32W(hdc, w.as_ptr(), w.len() as i32, &mut sz) };
+    sz.cx
+}
+
+/// Header, painted entirely by us. Custom draw can't do it: DarkMode_ItemsView fills
 /// the item backgrounds and the empty area right of the last column with its own fixed
 /// grey (#191919-ish) before any CDDS stage lets us in, so it never matches our palette.
 fn paint_header(a: &App, hwnd: HWND) {
@@ -1880,7 +2332,7 @@ fn paint_header(a: &App, hwnd: HWND) {
         let font = SendMessageW(hwnd, WM_GETFONT, 0, 0);
         let old_font = SelectObject(mem, font as _);
         SetBkMode(mem, TRANSPARENT as i32);
-        SetTextColor(mem, a.theme.fg);
+        SetTextColor(mem, a.theme.accent);
         let n = SendMessageW(hwnd, HDM_GETITEMCOUNT, 0, 0) as i32;
         let (pad, line) = (scale(8, a.dpi), scale(1, a.dpi).max(1));
         for i in 0..n {
@@ -1927,24 +2379,24 @@ fn paint_header(a: &App, hwnd: HWND) {
     }
 }
 
-/// Header subclass: full custom paint in dark themes, stock (themed) paint in light.
+/// Header subclass: full custom paint in every theme. Light used to keep the stock themed
+/// paint, but the visual style draws item text in its own colour (no CDRF hook changes it
+/// reliably), so the orange column titles need our painter there too.
 unsafe extern "system" fn header_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
     unsafe {
         if let Some(a) = app() {
-            if a.theme.dark {
-                match msg {
-                    WM_ERASEBKGND => return 1,
-                    WM_PAINT => {
-                        paint_header(a, hwnd);
-                        return 0;
-                    }
-                    // The stock header only repaints the hot item it tracked itself; with
-                    // our own paint a full invalidate on leave avoids a stuck hover.
-                    WM_MOUSELEAVE => {
-                        InvalidateRect(hwnd, null(), 0);
-                    }
-                    _ => {}
+            match msg {
+                WM_ERASEBKGND => return 1,
+                WM_PAINT => {
+                    paint_header(a, hwnd);
+                    return 0;
                 }
+                // The stock header only repaints the hot item it tracked itself; with
+                // our own paint a full invalidate on leave avoids a stuck hover.
+                WM_MOUSELEAVE => {
+                    InvalidateRect(hwnd, null(), 0);
+                }
+                _ => {}
             }
         }
         DefSubclassProc(hwnd, msg, wp, lp)
@@ -1955,6 +2407,34 @@ unsafe extern "system" fn header_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
     unsafe {
         if let Some(a) = app() {
+            if msg == WM_MOUSEMOVE || msg == WM_MOUSELEAVE {
+                let mut row = -1;
+                if msg == WM_MOUSEMOVE && a.settings.view == VIEW_DETAILS {
+                    let mut ht: LVHITTESTINFO = std::mem::zeroed();
+                    ht.pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
+                    row = SendMessageW(hwnd, LVM_HITTEST, 0, &mut ht as *mut _ as isize) as i32;
+                    let mut t = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+                    TrackMouseEvent(&mut t);
+                }
+                if row != a.hover_row {
+                    // Repaint only the row losing and the row gaining the hover.
+                    for r in [a.hover_row, row] {
+                        if r >= 0 {
+                            SendMessageW(hwnd, LVM_REDRAWITEMS, r as usize, r as isize);
+                        }
+                    }
+                    a.hover_row = row;
+                }
+                // The theme's blue hot box comes from the list's private hot item, which
+                // custom draw can't clear (CDIS_HOT is never even set for owner data). The
+                // list only learns it from button-less mouse moves, so in Details those
+                // stop here. Drag, marquee and click handling are unaffected: they run in
+                // the list's own capture loop after WM_LBUTTONDOWN.
+                let buttons = 0x1 | 0x2 | 0x10; // MK_LBUTTON | MK_RBUTTON | MK_MBUTTON
+                if msg == WM_MOUSEMOVE && a.settings.view == VIEW_DETAILS && wp & buttons == 0 {
+                    return 0;
+                }
+            }
             if msg == WM_CHAR {
                 let c = wp as u32;
                 // Printable characters (and Backspace) typed into the list go to the search box.
