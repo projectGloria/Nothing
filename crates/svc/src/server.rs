@@ -78,7 +78,7 @@ struct Session {
 fn client(engine: Arc<Engine>, mut pipe: File) {
     let mut s = Session { ids: Vec::new(), epoch: u64::MAX, version: u64::MAX, sort: Sort::Name, desc: false, query: None };
     let mut buf = Vec::new();
-    let mut path_cache: (u32, String) = (u32::MAX, String::new());
+    let mut path_cache: Option<(u32, String)> = None;
     while proto::read_frame(&mut pipe, &mut buf).is_ok() {
         let Some(req) = proto::parse_request(&buf) else { break };
         let mut m = W::new();
@@ -102,7 +102,7 @@ fn client(engine: Arc<Engine>, mut pipe: File) {
                 s.sort = sort;
                 s.desc = desc;
                 s.query = Some(q);
-                path_cache.0 = u32::MAX;
+                path_cache = None;
                 m.u32(gen).u32(s.ids.len() as u32).u32(t0.elapsed().as_micros() as u32);
             }
             Request::Rows { gen, first, count } => {
@@ -127,11 +127,12 @@ fn client(engine: Arc<Engine>, mut pipe: File) {
     }
 }
 
-fn row(ix: &Index, id: u32, cache: &mut (u32, String)) -> Row {
+fn row(ix: &Index, id: u32, cache: &mut Option<(u32, String)>) -> Row {
     let p = ix.parent[id as usize];
     // Neighbouring rows usually share a folder (name/path sort): skip re-walking it.
-    if cache.0 != p {
-        *cache = (p, ix.dir_path(id));
+    if cache.as_ref().map(|c| c.0) != Some(p) {
+        *cache = Some((p, ix.dir_path(id)));
     }
-    Row { flags: ix.flags[id as usize], size: ix.size[id as usize], mtime: ix.mtime[id as usize], name: ix.name(id).to_string(), path: cache.1.clone() }
+    let cached = cache.as_ref().unwrap();
+    Row { flags: ix.flags[id as usize], size: ix.size[id as usize], mtime: ix.mtime[id as usize], name: ix.name(id).to_string(), path: cached.1.clone() }
 }

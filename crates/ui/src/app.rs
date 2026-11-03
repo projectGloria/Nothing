@@ -79,6 +79,7 @@ struct RowView {
     date: Vec<u16>,
     icon: i32,
     bytes: u64,
+    mtime: u64,
     full: String,
     dir: bool,
 }
@@ -227,15 +228,26 @@ pub struct App {
     glyphs: HFONT,
     /// Details row under the mouse (-1 = none), tracked in `list_proc`.
     hover_row: i32,
+    /// Preserved selected file paths across in-place refreshes.
+    saved_selection: HashSet<String>,
+    saved_focus: Option<String>,
 }
 
 thread_local! {
     static APP: std::cell::Cell<*mut App> = const { std::cell::Cell::new(null_mut()) };
+    static APP_BORROWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn app() -> Option<&'static mut App> {
-    // SAFETY: the App lives for the whole message loop and is only touched on the UI thread.
-    APP.with(|a| unsafe { a.get().as_mut() })
+fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
+    let p = APP.with(|a| a.get());
+    if p.is_null() {
+        return None;
+    }
+    let already = APP_BORROWED.with(|b| b.replace(true));
+    assert!(!already, "re-entrant mutable borrow of App attempted!");
+    let res = f(unsafe { &mut *p });
+    APP_BORROWED.with(|b| b.set(false));
+    Some(res)
 }
 
 pub fn message(title: &str, text: &str, error: bool) {
@@ -494,51 +506,63 @@ pub fn run(start_hidden: bool, folder: Option<String>) -> i32 {
             small_icon: null_mut(),
             glyphs: null_mut(),
             hover_row: -1,
+            saved_selection: HashSet::new(),
+            saved_focus: None,
         });
         APP.with(|a| a.set(Box::into_raw(boxed)));
-        let a = app().unwrap();
-        for (i, (name, fmt)) in [("Name", LVCFMT_LEFT), ("Path", LVCFMT_LEFT), ("Size", LVCFMT_RIGHT), ("Date Modified", LVCFMT_LEFT)].iter().enumerate() {
-            let mut text = wide(name);
-            let col = LVCOLUMNW {
-                mask: LVCF_TEXT | LVCF_WIDTH | LVCF_FMT | LVCF_SUBITEM,
-                fmt: *fmt,
-                cx: scale(a.settings.cols[i], dpi),
-                pszText: text.as_mut_ptr(),
-                cchTextMax: 0,
-                iSubItem: i as i32,
-                iImage: 0,
-                iOrder: 0,
-                cxMin: 0,
-                cxDefault: 0,
-                cxIdeal: 0,
-            };
-            SendMessageW(list, LVM_INSERTCOLUMNW, i, &col as *const _ as isize);
-        }
-        a.apply_dpi(dpi);
-        a.apply_theme();
-        a.apply_view();
-        a.update_menu_checks();
-        a.update_sort_arrow();
-        a.add_tray();
-        a.register_hotkey();
-        a.layout();
-        a.run_query(false);
-        if !start_hidden {
-            a.show();
-            if a.settings.maximized {
-                ShowWindow(hwnd, SW_MAXIMIZE);
+        with_app(|a| {
+            for (i, (name, fmt)) in [("Name", LVCFMT_LEFT), ("Path", LVCFMT_LEFT), ("Size", LVCFMT_RIGHT), ("Date Modified", LVCFMT_LEFT)].iter().enumerate() {
+                let mut text = wide(name);
+                let col = LVCOLUMNW {
+                    mask: LVCF_TEXT | LVCF_WIDTH | LVCF_FMT | LVCF_SUBITEM,
+                    fmt: *fmt,
+                    cx: scale(a.settings.cols[i], dpi),
+                    pszText: text.as_mut_ptr(),
+                    cchTextMax: 0,
+                    iSubItem: i as i32,
+                    iImage: 0,
+                    iOrder: 0,
+                    cxMin: 0,
+                    cxDefault: 0,
+                    cxIdeal: 0,
+                };
+                SendMessageW(list, LVM_INSERTCOLUMNW, i, &col as *const _ as isize);
             }
-        }
-        if let Some(f) = folder {
-            a.open_folder(&f);
-        }
+            a.apply_dpi(dpi);
+            a.apply_theme();
+            a.apply_view();
+            a.update_menu_checks();
+            a.update_sort_arrow();
+            a.add_tray();
+            a.register_hotkey();
+            a.layout();
+            a.run_query(false);
+            if !start_hidden {
+                a.show();
+                if a.settings.maximized {
+                    ShowWindow(hwnd, SW_MAXIMIZE);
+                }
+            }
+            if let Some(f) = folder {
+                a.open_folder(&f);
+            }
+        });
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            if let Some(a) = app() {
+            let mut handled = false;
+            let mut main_hwnd = null_mut();
+            with_app(|a| {
+                main_hwnd = a.hwnd;
                 if a.pre_translate(&msg) {
-                    continue;
+                    handled = true;
                 }
+            });
+            if handled {
+                continue;
+            }
+            if msg.message == WM_KEYDOWN && IsDialogMessageW(main_hwnd, &msg) != 0 {
+                continue;
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -569,10 +593,33 @@ impl App {
         self.inflight = Some(self.gen);
         self.requested.clear();
         self.thumbs.dirty = true;
+        self.thumbs.invalidate_failed();
         if keep {
+            let mut saved_sel = HashSet::new();
+            let mut saved_foc = None;
+            let mut i = -1i32;
+            loop {
+                i = unsafe { SendMessageW(self.list, LVM_GETNEXTITEM, i as usize, LVNI_SELECTED as isize) as i32 };
+                if i < 0 {
+                    break;
+                }
+                if let Some(r) = self.rows.get(&(i as u32)).or_else(|| self.stale.get(&(i as u32))) {
+                    saved_sel.insert(r.full.clone());
+                }
+            }
+            let foc = unsafe { SendMessageW(self.list, LVM_GETNEXTITEM, usize::MAX, LVNI_FOCUSED as isize) as i32 };
+            if foc >= 0 {
+                if let Some(r) = self.rows.get(&(foc as u32)).or_else(|| self.stale.get(&(foc as u32))) {
+                    saved_foc = Some(r.full.clone());
+                }
+            }
+            self.saved_selection = saved_sel;
+            self.saved_focus = saved_foc;
             let old = std::mem::take(&mut self.rows);
             self.stale = old;
         } else {
+            self.saved_selection.clear();
+            self.saved_focus = None;
             self.rows.clear();
             self.stale.clear();
         }
@@ -605,6 +652,7 @@ impl App {
             date: wide(&date(r.mtime)),
             icon,
             bytes: if is_dir { 0 } else { r.size },
+            mtime: r.mtime,
             full,
             dir: is_dir,
         }
@@ -616,6 +664,13 @@ impl App {
             let idx = first + i as u32;
             let v = self.make_row(r);
             self.stale.remove(&idx);
+            if !self.saved_selection.is_empty() && self.saved_selection.contains(&v.full) {
+                let is_foc = self.saved_focus.as_deref() == Some(&v.full);
+                let mut st: LVITEMW = unsafe { std::mem::zeroed() };
+                st.state = LVIS_SELECTED | if is_foc { LVIS_FOCUSED } else { 0 };
+                st.stateMask = LVIS_SELECTED | if is_foc { LVIS_FOCUSED } else { 0 };
+                unsafe { SendMessageW(self.list, LVM_SETITEMSTATE, idx as usize, &st as *const _ as isize) };
+            }
             self.rows.insert(idx, v);
         }
         // Newly known paths may fall in the thumbnail window.
@@ -653,6 +708,9 @@ impl App {
                 unsafe {
                     if keep {
                         SendMessageW(self.list, LVM_SETITEMCOUNT, total as usize, (LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL) as isize);
+                        let mut st: LVITEMW = std::mem::zeroed();
+                        st.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+                        SendMessageW(self.list, LVM_SETITEMSTATE, usize::MAX, &st as *const _ as isize);
                     } else {
                         SendMessageW(self.list, LVM_SETITEMCOUNT, total as usize, 0);
                         let mut st: LVITEMW = std::mem::zeroed();
@@ -786,7 +844,7 @@ impl App {
             }
             return;
         };
-        if self.detail.as_ref().is_some_and(|d| d.idx == i as u32 && d.full == r.full) {
+        if self.detail.as_ref().is_some_and(|d| d.idx == i as u32 && d.full == r.full && d.bytes == r.bytes && d.mtime == r.mtime) {
             return;
         }
         self.detail = Some(describe(i as u32, r));
@@ -1180,27 +1238,6 @@ impl App {
         unsafe { Shell_NotifyIconW(NIM_DELETE, &nid) };
     }
 
-    fn tray_menu(&mut self) {
-        unsafe {
-            let m = CreatePopupMenu();
-            AppendMenuW(m, MF_STRING, ID_TRAY_SHOW as usize, wide("&Show Nothing").as_ptr());
-            AppendMenuW(m, MF_SEPARATOR, 0, null());
-            AppendMenuW(m, MF_STRING, ID_EXIT as usize, wide("E&xit").as_ptr());
-            SetMenuDefaultItem(m, ID_TRAY_SHOW as u32, 0);
-            let mut pt = POINT { x: 0, y: 0 };
-            GetCursorPos(&mut pt);
-            // Required for the menu to close when clicking elsewhere (KB135788).
-            SetForegroundWindow(self.hwnd);
-            let cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, self.hwnd, null());
-            DestroyMenu(m);
-            match cmd as u16 {
-                ID_TRAY_SHOW => self.show(),
-                ID_EXIT => self.exit(),
-                _ => {}
-            }
-        }
-    }
-
     fn register_hotkey(&mut self) {
         const MOD_NOREPEAT: u32 = 0x4000;
         self.hotkey_ok = unsafe { RegisterHotKey(self.hwnd, HOTKEY_ID, self.settings.hotkey_mods | MOD_NOREPEAT, self.settings.hotkey_vk) } != 0;
@@ -1224,7 +1261,26 @@ impl App {
         if !missing.is_empty() {
             self.fetch_sync(&missing);
         }
-        idx.iter().filter_map(|i| self.rows.get(i).map(|r| r.full.clone())).collect()
+        let mut result = Vec::new();
+        for i in idx {
+            if let Some(r) = self.rows.get(&i) {
+                if !self.saved_selection.is_empty() && !self.saved_selection.contains(&r.full) {
+                    let mut desel: LVITEMW = unsafe { std::mem::zeroed() };
+                    desel.stateMask = LVIS_SELECTED;
+                    unsafe { SendMessageW(self.list, LVM_SETITEMSTATE, i as usize, &desel as *const _ as isize) };
+                    continue;
+                }
+                result.push(r.full.clone());
+            } else {
+                let mut desel: LVITEMW = unsafe { std::mem::zeroed() };
+                desel.stateMask = LVIS_SELECTED;
+                unsafe { SendMessageW(self.list, LVM_SETITEMSTATE, i as usize, &desel as *const _ as isize) };
+            }
+        }
+        if result.is_empty() && !self.saved_selection.is_empty() {
+            return self.saved_selection.iter().take(cap).cloned().collect();
+        }
+        result
     }
 
     fn fetch_sync(&mut self, missing: &[u32]) {
@@ -1253,7 +1309,13 @@ impl App {
             let rows: Vec<Row> = (0..n).map(|_| proto::get_row(&mut r)).collect();
             for (k, row) in rows.into_iter().enumerate() {
                 let v = self.make_row(row);
-                self.rows.insert(f + k as u32, v);
+                let idx = f + k as u32;
+                if !self.saved_selection.is_empty() && !self.saved_selection.contains(&v.full) {
+                    let mut desel: LVITEMW = unsafe { std::mem::zeroed() };
+                    desel.stateMask = LVIS_SELECTED;
+                    unsafe { SendMessageW(self.list, LVM_SETITEMSTATE, idx as usize, &desel as *const _ as isize) };
+                }
+                self.rows.insert(idx, v);
             }
         }
     }
@@ -1444,6 +1506,7 @@ impl App {
                 true
             }
             VK_F5 => {
+                self.thumbs.invalidate_failed();
                 self.run_query(true);
                 true
             }
@@ -1454,18 +1517,29 @@ impl App {
             }
             VK_BACK if ctrl && in_edit => {
                 // Classic EDIT inserts a box glyph for Ctrl+Backspace; delete a word instead.
-                let t: Vec<char> = self.search_text().chars().collect();
-                let mut end = t.len();
-                while end > 0 && t[end - 1] == ' ' {
-                    end -= 1;
-                }
-                while end > 0 && t[end - 1] != ' ' && t[end - 1] != '\\' {
-                    end -= 1;
-                }
-                let s: String = t[..end].iter().collect();
+                let mut sel_start: u32 = 0;
+                let mut sel_end: u32 = 0;
                 unsafe {
-                    SetWindowTextW(self.edit, wide(&s).as_ptr());
-                    SendMessageW(self.edit, EM_SETSEL, s.encode_utf16().count(), s.encode_utf16().count() as isize);
+                    SendMessageW(self.edit, EM_GETSEL, &mut sel_start as *mut _ as usize, &mut sel_end as *mut _ as isize);
+                }
+                if sel_start != sel_end {
+                    unsafe {
+                        SendMessageW(self.edit, EM_REPLACESEL, 1, wide("").as_ptr() as isize);
+                    }
+                } else if sel_start > 0 {
+                    let text = self.search_text();
+                    let units: Vec<u16> = text.encode_utf16().collect();
+                    let mut start = (sel_start as usize).min(units.len());
+                    while start > 0 && units[start - 1] == ' ' as u16 {
+                        start -= 1;
+                    }
+                    while start > 0 && units[start - 1] != ' ' as u16 && units[start - 1] != '\\' as u16 {
+                        start -= 1;
+                    }
+                    unsafe {
+                        SendMessageW(self.edit, EM_SETSEL, start, sel_start as isize);
+                        SendMessageW(self.edit, EM_REPLACESEL, 1, wide("").as_ptr() as isize);
+                    }
                 }
                 true
             }
@@ -1539,43 +1613,13 @@ impl App {
                     self.set_sort(self.settings.sort);
                 }
             }
-            ID_REFRESH => self.run_query(true),
+            ID_REFRESH => {
+                self.thumbs.invalidate_failed();
+                self.run_query(true);
+            }
             x if (ID_VIEW_BASE..ID_VIEW_BASE + 4).contains(&x) => self.set_view((x - ID_VIEW_BASE) as u8),
             x if (ID_THEME_BASE..ID_THEME_BASE + 4).contains(&x) => self.set_theme((x - ID_THEME_BASE) as u8),
             ID_INSTALL => self.install_service(false),
-            ID_UNINSTALL => {
-                let r = unsafe {
-                    MessageBoxW(self.hwnd, wide("Remove the indexing service and its index?").as_ptr(), wide("Nothing").as_ptr(), MB_YESNO | MB_ICONQUESTION)
-                };
-                if r == IDYES {
-                    self.install_service(true);
-                }
-            }
-            ID_SYNTAX => message(
-                "Search syntax",
-                "foo bar\tboth words (AND)\n\
-                 foo | bar\teither word (OR)\n\
-                 !foo\t\texclude\n\
-                 \"a b\"\t\texact phrase with spaces\n\
-                 *.mkv  a?c\twildcards (match the whole name)\n\
-                 users\\nihil\\\tany \\ in a term matches the full path\n\
-                 ext:jpg;png\tby extension\n\
-                 !video  !doc\tby type: video audio image doc archive exe\n\
-                 file:  folder:\tonly files / only folders\n\
-                 case:  path:\tper-term match case / match full path\n\n\
-                 Enter open · Ctrl+Enter open folder · Ctrl+C copy · Ctrl+Shift+C copy path\n\
-                 Del delete · Alt+Enter properties · Esc clear/hide · Win+Alt+Space show",
-                false,
-            ),
-            ID_ABOUT => message(
-                "About Nothing",
-                &format!(
-                    "Nothing {}\nInstant file-name search for Windows.\n\nReads the NTFS Master File Table directly and follows the USN change journal.\n{}",
-                    env!("CARGO_PKG_VERSION"),
-                    if self.hotkey_ok { "Global hotkey: Win+Alt+Space" } else { "Global hotkey unavailable (already taken)." }
-                ),
-                false,
-            ),
             _ => {}
         }
     }
@@ -1782,78 +1826,44 @@ impl App {
         }
         self.thumbs.window = (wlo, whi);
         self.thumbs.dirty = false;
-        let (rows, thumbs) = (&self.rows, &self.thumbs);
+        let rows = &self.rows;
+        let thumbs = &mut self.thumbs;
         let order = (lo..=hi).chain(hi + 1..=whi).chain((wlo..lo).rev());
-        thumbs.schedule(order.filter_map(|i| rows.get(&i).filter(|r| !r.dir && thumbs.wants(&r.full)).map(|r| (i, r.full.as_str()))));
+        let mut items = Vec::new();
+        for i in order {
+            if let Some(r) = rows.get(&i) {
+                if !r.dir && thumbs.wants(&r.full, r.mtime, r.bytes) {
+                    items.push((i, r.full.as_str(), r.mtime, r.bytes));
+                }
+            }
+        }
+        thumbs.schedule(items.into_iter());
     }
 
     fn on_thumb(&mut self, d: Done) {
         // Check the row before `accept` consumes the path: a new query may have moved it.
         let same_row = self.rows.get(&d.row).is_some_and(|r| r.full == d.path);
         let row = d.row;
-        if !self.thumbs.accept(d) {
+        let Some(repainted) = self.thumbs.accept(d) else {
+            self.thumbs.dirty = true;
+            if self.thumbs.active() {
+                self.schedule_thumbs();
+            }
             return;
-        }
-        unsafe {
-            if same_row {
-                SendMessageW(self.list, LVM_REDRAWITEMS, row as usize, row as isize);
-            } else {
-                InvalidateRect(self.list, null(), 0);
+        };
+        if repainted {
+            unsafe {
+                if same_row {
+                    SendMessageW(self.list, LVM_REDRAWITEMS, row as usize, row as isize);
+                } else {
+                    InvalidateRect(self.list, null(), 0);
+                }
             }
         }
         if self.thumbs.over_budget() {
             let (wlo, whi) = self.thumbs.window;
             let keep: HashSet<&str> = (wlo..=whi).filter_map(|i| self.rows.get(&i)).map(|r| r.full.as_str()).collect();
             self.thumbs.evict(&keep);
-        }
-    }
-
-    /// Right-click on the list. On a row: Explorer's real menu for the selection, plus
-    /// our Open Path / Copy Full Path. On blank space: View / Sort By / Refresh, like
-    /// Everything (the ListView has already cleared the selection by then, which is why
-    /// this used to show nothing at all).
-    fn context_menu(&mut self, pt: POINT, keyboard: bool) {
-        let on_item = if keyboard {
-            self.selected_count() > 0
-        } else {
-            let mut ht: LVHITTESTINFO = unsafe { std::mem::zeroed() };
-            ht.pt = pt;
-            unsafe {
-                ScreenToClient(self.list, &mut ht.pt);
-                SendMessageW(self.list, LVM_HITTEST, 0, &mut ht as *mut _ as isize) >= 0
-            }
-        };
-        let paths = if on_item { self.selected_paths(10_000) } else { Vec::new() };
-        if paths.is_empty() {
-            self.background_menu(pt);
-            return;
-        }
-        let extra = [(ID_CTX_REVEAL, "Open &Path"), (ID_CTX_COPY_PATH, "Copy &Full Path")];
-        match shell::context_menu(self.hwnd, &paths, pt, &extra) {
-            Some(ID_CTX_REVEAL) => self.reveal_selected(),
-            Some(ID_CTX_COPY_PATH) => self.copy_selected(true),
-            _ => {}
-        }
-    }
-
-    fn background_menu(&mut self, pt: POINT) {
-        unsafe {
-            let m = CreatePopupMenu();
-            sub(m, view_menu(), "&View");
-            sub(m, sort_menu(), "&Sort By");
-            sep(m);
-            add(m, ID_SELECT_ALL, "Select &All	Ctrl+A");
-            add(m, ID_REFRESH, "&Refresh	F5");
-            check_radios(m, &self.settings);
-            if self.total == 0 {
-                EnableMenuItem(m, ID_SELECT_ALL as u32, MF_BYCOMMAND | MF_GRAYED);
-            }
-            let cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, self.hwnd, null());
-            // Destroying the parent destroys the attached submenus too.
-            DestroyMenu(m);
-            if cmd > 0 {
-                self.on_command(cmd as u16);
-            }
         }
     }
 
@@ -1928,13 +1938,10 @@ impl App {
 
     /// Button press. DefWindowProc never sees it: its own handling would run the
     /// Windows 95 button-tracking loop and paint a classic button over ours.
-    fn caption_press(&mut self, ht: u32) {
-        if ht == HTMENU {
-            self.caption_menu();
-            return;
-        }
+    fn caption_press(&mut self, ht: u32) -> bool {
         self.cap_down = ht;
         self.invalidate_caption();
+        ht == HTMENU
     }
 
     /// Button release: acts only if it lands on the button that was pressed, like a
@@ -1954,36 +1961,6 @@ impl App {
         };
         self.cap_hot = 0;
         unsafe { PostMessageW(self.hwnd, WM_SYSCOMMAND, sc as usize, 0) };
-    }
-
-    /// The menu button's popup, dropped from the button's bottom-right corner. Also
-    /// what Alt / F10 open, now that there is no menu bar for them to activate.
-    fn caption_menu(&mut self) {
-        let mut r = self.caption_buttons()[0].1;
-        self.cap_down = HTMENU;
-        self.cap_hot = HTMENU;
-        self.invalidate_caption();
-        // UpdateWindow and the menu loop re-enter wndproc, which reaches this App through
-        // a second &mut from app(). The optimizer assumes &mut self is exclusive, so in
-        // release it sank the two stores above past those calls and then dropped them as
-        // dead (overwritten with 0 below): the paint saw "not pressed". black_box makes
-        // self escape here, forcing the stores out first and fresh loads afterwards.
-        std::hint::black_box(&mut *self);
-        unsafe {
-            UpdateWindow(self.hwnd); // show the pressed state before the modal loop starts
-            let mut pts = [POINT { x: r.left, y: r.top }, POINT { x: r.right, y: r.bottom }];
-            MapWindowPoints(self.hwnd, null_mut(), pts.as_mut_ptr(), 2);
-            r = RECT { left: pts[0].x, top: pts[0].y, right: pts[1].x, bottom: pts[1].y };
-            let tpm = TPMPARAMS { cbSize: std::mem::size_of::<TPMPARAMS>() as u32, rcExclude: r };
-            let cmd = TrackPopupMenuEx(self.menu, TPM_RETURNCMD | TPM_RIGHTALIGN | TPM_TOPALIGN | TPM_VERTICAL, r.right, r.bottom, self.hwnd, &tpm);
-            std::hint::black_box(&mut *self);
-            self.cap_down = 0;
-            self.cap_hot = 0;
-            self.invalidate_caption();
-            if cmd > 0 {
-                self.on_command(cmd as u16);
-            }
-        }
     }
 
     /// Icon, title and the four buttons. The background is already filled by `paint`.
@@ -2033,6 +2010,177 @@ fn is_caption_button(ht: u32) -> bool {
     matches!(ht, HTMENU | HTMINBUTTON | HTMAXBUTTON | HTCLOSE)
 }
 
+fn dispatch_command(id: u16) {
+    enum Action {
+        None,
+        ConfirmUninstall(HWND),
+        Syntax,
+        About(bool),
+    }
+    let act = with_app(|a| {
+        match id {
+            ID_UNINSTALL => Action::ConfirmUninstall(a.hwnd),
+            ID_SYNTAX => Action::Syntax,
+            ID_ABOUT => Action::About(a.hotkey_ok),
+            _ => {
+                a.on_command(id);
+                Action::None
+            }
+        }
+    }).unwrap_or(Action::None);
+
+    match act {
+        Action::ConfirmUninstall(hwnd) => {
+            let r = unsafe {
+                MessageBoxW(hwnd, wide("Remove the indexing service and its index?").as_ptr(), wide("Nothing").as_ptr(), MB_YESNO | MB_ICONQUESTION)
+            };
+            if r == IDYES {
+                with_app(|a| a.install_service(true));
+            }
+        }
+        Action::Syntax => {
+            message(
+                "Search syntax",
+                "foo bar\tboth words (AND)\n\
+                 foo | bar\teither word (OR)\n\
+                 !foo\t\texclude\n\
+                 \"a b\"\t\texact phrase with spaces\n\
+                 *.mkv  a?c\twildcards (match the whole name)\n\
+                 users\\nihil\\\tany \\ in a term matches the full path\n\
+                 ext:jpg;png\tby extension\n\
+                 !video  !doc\tby type: video audio image doc archive exe\n\
+                 file:  folder:\tonly files / only folders\n\
+                 case:  path:\tper-term match case / match full path\n\n\
+                 Enter open · Ctrl+Enter open folder · Ctrl+C copy · Ctrl+Shift+C copy path\n\
+                 Del delete · Alt+Enter properties · Esc clear/hide · Win+Alt+Space show",
+                false,
+            );
+        }
+        Action::About(hotkey_ok) => {
+            message(
+                "About Nothing",
+                &format!(
+                    "Nothing {}\nInstant file-name search for Windows.\n\nReads the NTFS Master File Table directly and follows the USN change journal.\n{}",
+                    env!("CARGO_PKG_VERSION"),
+                    if hotkey_ok { "Global hotkey: Win+Alt+Space" } else { "Global hotkey unavailable (already taken)." }
+                ),
+                false,
+            );
+        }
+        Action::None => {}
+    }
+}
+
+fn run_caption_menu() {
+    let prep = with_app(|a| {
+        let r = a.caption_buttons()[0].1;
+        a.cap_down = HTMENU;
+        a.cap_hot = HTMENU;
+        a.invalidate_caption();
+        (a.hwnd, a.menu, r)
+    });
+    let Some((hwnd, menu, mut r)) = prep else { return };
+    let cmd = unsafe {
+        UpdateWindow(hwnd);
+        let mut pts = [POINT { x: r.left, y: r.top }, POINT { x: r.right, y: r.bottom }];
+        MapWindowPoints(hwnd, null_mut(), pts.as_mut_ptr(), 2);
+        r = RECT { left: pts[0].x, top: pts[0].y, right: pts[1].x, bottom: pts[1].y };
+        let tpm = TPMPARAMS { cbSize: std::mem::size_of::<TPMPARAMS>() as u32, rcExclude: r };
+        TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTALIGN | TPM_TOPALIGN | TPM_VERTICAL, r.right, r.bottom, hwnd, &tpm)
+    };
+    with_app(|a| {
+        a.cap_down = 0;
+        a.cap_hot = 0;
+        a.invalidate_caption();
+    });
+    if cmd > 0 {
+        dispatch_command(cmd as u16);
+    }
+}
+
+fn run_background_menu(pt: POINT) {
+    let prep = with_app(|a| {
+        let m = unsafe { CreatePopupMenu() };
+        sub(m, view_menu(), "&View");
+        sub(m, sort_menu(), "&Sort By");
+        sep(m);
+        add(m, ID_SELECT_ALL, "Select &All\tCtrl+A");
+        add(m, ID_REFRESH, "&Refresh\tF5");
+        check_radios(m, &a.settings);
+        if a.total == 0 {
+            unsafe { EnableMenuItem(m, ID_SELECT_ALL as u32, MF_BYCOMMAND | MF_GRAYED) };
+        }
+        (a.hwnd, m)
+    });
+    let Some((hwnd, m)) = prep else { return };
+    let cmd = unsafe {
+        let c = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, hwnd, null());
+        DestroyMenu(m);
+        c
+    };
+    if cmd > 0 {
+        dispatch_command(cmd as u16);
+    }
+}
+
+fn run_context_menu(pt: POINT, keyboard: bool) {
+    let check = with_app(|a| {
+        let on_item = if keyboard {
+            a.selected_count() > 0
+        } else {
+            let mut ht: LVHITTESTINFO = unsafe { std::mem::zeroed() };
+            ht.pt = pt;
+            unsafe {
+                ScreenToClient(a.list, &mut ht.pt);
+                SendMessageW(a.list, LVM_HITTEST, 0, &mut ht as *mut _ as isize) >= 0
+            }
+        };
+        let paths = if on_item { a.selected_paths(10_000) } else { Vec::new() };
+        (a.hwnd, paths)
+    });
+    let Some((hwnd, paths)) = check else { return };
+    if paths.is_empty() {
+        run_background_menu(pt);
+        return;
+    }
+    let extra = [(ID_CTX_REVEAL, "Open &Path"), (ID_CTX_COPY_PATH, "Copy &Full Path")];
+    let result = shell::context_menu(hwnd, &paths, pt, &extra);
+    match result {
+        Some(ID_CTX_REVEAL) => {
+            with_app(|a| a.reveal_selected());
+        }
+        Some(ID_CTX_COPY_PATH) => {
+            with_app(|a| a.copy_selected(true));
+        }
+        _ => {}
+    }
+}
+
+fn run_tray_menu() {
+    let hwnd = match with_app(|a| a.hwnd) {
+        Some(h) => h,
+        None => return,
+    };
+    let cmd = unsafe {
+        let m = CreatePopupMenu();
+        AppendMenuW(m, MF_STRING, ID_TRAY_SHOW as usize, wide("&Show Nothing").as_ptr());
+        AppendMenuW(m, MF_SEPARATOR, 0, null());
+        AppendMenuW(m, MF_STRING, ID_EXIT as usize, wide("E&xit").as_ptr());
+        SetMenuDefaultItem(m, ID_TRAY_SHOW as u32, 0);
+        let mut pt = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut pt);
+        SetForegroundWindow(hwnd);
+        let c = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, hwnd, null());
+        DestroyMenu(m);
+        c
+    };
+    match cmd as u16 {
+        ID_TRAY_SHOW => { with_app(|a| a.show()); }
+        ID_EXIT => { with_app(|a| a.exit()); }
+        _ => {}
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     // While a shell context menu is open, its owner-drawn submenus need these messages.
     if matches!(msg, WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR) {
@@ -2054,94 +2202,108 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return r;
         }
     }
-    let Some(a) = app() else { return unsafe { DefWindowProcW(hwnd, msg, wp, lp) } };
     unsafe {
         match msg {
             WM_SIZE => {
-                a.layout();
+                with_app(|a| a.layout());
                 0
             }
             WM_PAINT => {
-                a.paint();
+                with_app(|a| a.paint());
                 0
             }
             WM_ERASEBKGND => 1,
             // The painted field is larger than the EDIT; clicks on its padding still focus it.
             WM_LBUTTONDOWN => {
                 let pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
-                if PtInRect(&a.field_rect(), pt) != 0 {
-                    SetFocus(a.edit);
-                    SendMessageW(a.edit, EM_SETSEL, 0, -1);
-                }
+                with_app(|a| {
+                    if PtInRect(&a.field_rect(), pt) != 0 {
+                        SetFocus(a.edit);
+                        SendMessageW(a.edit, EM_SETSEL, 0, -1);
+                    }
+                });
                 0
             }
             WM_CTLCOLOREDIT => {
-                let hdc = wp as HDC;
-                SetTextColor(hdc, a.theme.fg);
-                SetBkColor(hdc, a.theme.field);
-                a.theme.br_field as LRESULT
+                with_app(|a| {
+                    let hdc = wp as HDC;
+                    SetTextColor(hdc, a.theme.fg);
+                    SetBkColor(hdc, a.theme.field);
+                    a.theme.br_field as LRESULT
+                }).unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp))
             }
             WM_COMMAND => {
+                let is_edit = with_app(|a| lp as HWND == a.edit).unwrap_or(false);
                 let code = (wp >> 16) as u32;
-                if lp as HWND == a.edit {
+                if is_edit {
                     if code == EN_CHANGE {
-                        a.run_query(false);
+                        with_app(|a| a.run_query(false));
                     }
-                    return 0;
+                    0
+                } else {
+                    dispatch_command(loword(wp) as u16);
+                    0
                 }
-                a.on_command(loword(wp) as u16);
-                0
             }
-            WM_NOTIFY => a.on_notify(lp).unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp)),
-            WM_CONTEXTMENU if wp as HWND == a.list => {
-                let mut pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
-                if lp == -1 {
-                    // Keyboard (Shift+F10 / menu key): anchor at the focused row.
-                    let i = SendMessageW(a.list, LVM_GETNEXTITEM, usize::MAX, LVNI_FOCUSED as isize);
-                    let mut r = RECT { left: LVIR_LABEL as i32, top: 0, right: 0, bottom: 0 };
-                    SendMessageW(a.list, LVM_GETITEMRECT, i.max(0) as usize, &mut r as *mut _ as isize);
-                    pt = POINT { x: r.left, y: r.bottom };
-                    ClientToScreen(a.list, &mut pt);
+            WM_NOTIFY => with_app(|a| a.on_notify(lp)).flatten().unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp)),
+            WM_CONTEXTMENU => {
+                let is_list = with_app(|a| wp as HWND == a.list).unwrap_or(false);
+                if is_list {
+                    let mut pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
+                    if lp == -1 {
+                        // Keyboard (Shift+F10 / menu key): anchor at the focused row.
+                        with_app(|a| {
+                            let i = SendMessageW(a.list, LVM_GETNEXTITEM, usize::MAX, LVNI_FOCUSED as isize);
+                            let mut r = RECT { left: LVIR_LABEL as i32, top: 0, right: 0, bottom: 0 };
+                            SendMessageW(a.list, LVM_GETITEMRECT, i.max(0) as usize, &mut r as *mut _ as isize);
+                            pt = POINT { x: r.left, y: r.bottom };
+                            ClientToScreen(a.list, &mut pt);
+                        });
+                    }
+                    run_context_menu(pt, lp == -1);
+                    0
+                } else {
+                    DefWindowProcW(hwnd, msg, wp, lp)
                 }
-                a.context_menu(pt, lp == -1);
-                0
             }
             WM_TIMER if wp == TIMER_STATUS => {
-                a.ipc.send(Cmd::Status);
+                with_app(|a| a.ipc.send(Cmd::Status));
                 0
             }
             WM_APP_IPC => {
                 let ev = Box::from_raw(lp as *mut Event);
-                a.on_ipc(*ev);
+                with_app(|a| a.on_ipc(*ev));
                 0
             }
             WM_APP_ICON => {
                 let b = Box::from_raw(lp as *mut (String, i32));
                 let (path, idx) = *b;
-                for (i, r) in a.rows.iter_mut() {
-                    if r.full == path && idx >= 0 {
-                        r.icon = idx;
-                        SendMessageW(a.list, LVM_REDRAWITEMS, *i as usize, *i as isize);
+                with_app(|a| {
+                    for (i, r) in a.rows.iter_mut() {
+                        if r.full == path && idx >= 0 {
+                            r.icon = idx;
+                            SendMessageW(a.list, LVM_REDRAWITEMS, *i as usize, *i as isize);
+                        }
                     }
-                }
-                a.icons.resolved(path, idx);
+                    a.icons.resolved(path, idx);
+                });
                 0
             }
             WM_APP_THUMB => {
                 let d = Box::from_raw(lp as *mut Done);
-                a.on_thumb(*d);
+                with_app(|a| a.on_thumb(*d));
                 0
             }
             WM_APP_TRAY => {
                 match (lp & 0xFFFF) as u32 {
-                    WM_LBUTTONUP => a.toggle(),
-                    WM_RBUTTONUP | WM_CONTEXTMENU => a.tray_menu(),
+                    WM_LBUTTONUP => { with_app(|a| a.toggle()); }
+                    WM_RBUTTONUP | WM_CONTEXTMENU => run_tray_menu(),
                     _ => {}
                 }
                 0
             }
             WM_APP_SHOW => {
-                a.show();
+                with_app(|a| a.show());
                 0
             }
             // A second nothing.exe launched by the folder verb hands its folder over.
@@ -2149,38 +2311,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let cds = &*(lp as *const windows_sys::Win32::System::DataExchange::COPYDATASTRUCT);
                 if cds.dwData == COPYDATA_FOLDER && !cds.lpData.is_null() {
                     let units = std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2);
-                    a.open_folder(&String::from_utf16_lossy(units));
+                    let folder = String::from_utf16_lossy(units);
+                    with_app(|a| a.open_folder(&folder));
                 }
                 1
             }
             WM_HOTKEY => {
-                a.toggle();
+                with_app(|a| a.toggle());
                 0
             }
             WM_ACTIVATE => {
-                if loword(wp) == WA_INACTIVE {
-                    let f = GetFocus();
-                    if f == a.edit || f == a.list {
-                        a.last_focus = f;
+                with_app(|a| {
+                    if loword(wp) == WA_INACTIVE {
+                        let f = GetFocus();
+                        if f == a.edit || f == a.list {
+                            a.last_focus = f;
+                        }
+                    } else {
+                        SetFocus(a.last_focus);
                     }
-                } else {
-                    SetFocus(a.last_focus);
-                }
+                });
                 0
             }
             WM_CLOSE => {
-                if a.exiting {
+                let exiting = with_app(|a| a.exiting).unwrap_or(false);
+                if exiting {
                     DefWindowProcW(hwnd, msg, wp, lp)
                 } else {
-                    a.hide(); // keep running in the tray: the next summon is instant
+                    with_app(|a| a.hide()); // keep running in the tray: the next summon is instant
                     0
                 }
             }
             WM_QUERYENDSESSION => 1,
             WM_ENDSESSION => {
                 if wp != 0 {
-                    a.save_settings();
-                    a.remove_tray();
+                    with_app(|a| {
+                        a.save_settings();
+                        a.remove_tray();
+                    });
                 }
                 0
             }
@@ -2189,19 +2357,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 0
             }
             WM_GETMINMAXINFO => {
+                let dpi = with_app(|a| a.dpi).unwrap_or(96);
                 let mm = &mut *(lp as *mut MINMAXINFO);
-                mm.ptMinTrackSize = POINT { x: scale(420, a.dpi), y: scale(240, a.dpi) };
+                mm.ptMinTrackSize = POINT { x: scale(420, dpi), y: scale(240, dpi) };
                 0
             }
             WM_DPICHANGED => {
                 let r = &*(lp as *const RECT);
-                a.apply_dpi(loword(wp));
+                with_app(|a| a.apply_dpi(loword(wp)));
                 SetWindowPos(hwnd, null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
                 0
             }
             WM_SETTINGCHANGE => {
                 if lp != 0 && from_wide(std::slice::from_raw_parts(lp as *const u16, 64)).starts_with("ImmersiveColorSet") {
-                    a.apply_theme();
+                    with_app(|a| a.apply_theme());
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
@@ -2212,44 +2381,57 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 let mut pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
                 ScreenToClient(hwnd, &mut pt);
-                a.caption_hit(pt) as LRESULT
+                with_app(|a| a.caption_hit(pt) as LRESULT).unwrap_or(r)
             }
             WM_NCMOUSEMOVE => {
-                a.set_caption_hot(wp as u32);
+                with_app(|a| a.set_caption_hot(wp as u32));
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             // Also fires as the menu's modal loop grabs the mouse: keep the menu button
-            // lit while its popup is open (caption_menu clears it afterwards).
-            WM_NCMOUSELEAVE if a.cap_down != HTMENU => {
-                a.cap_down = 0;
-                a.set_caption_hot(0);
+            // lit while its popup is open (run_caption_menu clears it afterwards).
+            WM_NCMOUSELEAVE => {
+                with_app(|a| {
+                    if a.cap_down != HTMENU {
+                        a.cap_down = 0;
+                        a.set_caption_hot(0);
+                    }
+                });
                 0
             }
             WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK if is_caption_button(wp as u32) => {
-                a.caption_press(wp as u32);
+                let open_menu = with_app(|a| a.caption_press(wp as u32)).unwrap_or(false);
+                if open_menu {
+                    run_caption_menu();
+                }
                 0
             }
             WM_NCLBUTTONUP if is_caption_button(wp as u32) => {
-                a.caption_release(wp as u32);
+                with_app(|a| a.caption_release(wp as u32));
                 0
             }
             WM_NCACTIVATE => {
-                a.active = wp != 0;
-                a.invalidate_caption();
+                with_app(|a| {
+                    a.active = wp != 0;
+                    a.invalidate_caption();
+                });
                 // lParam -1: don't repaint the (now nonexistent) non-client caption.
                 DefWindowProcW(hwnd, msg, wp, -1)
             }
             // Alt / F10 with no menu bar: open the caption menu instead. Alt+Space
             // (lParam ' ') still reaches the system menu.
             WM_SYSCOMMAND if (wp & 0xFFF0) as u32 == SC_KEYMENU && lp == 0 => {
-                a.caption_menu();
+                run_caption_menu();
                 0
             }
-            m if m == a.taskbar_created && m != 0 => {
-                a.add_tray(); // Explorer restarted
-                0
+            m => {
+                let is_taskbar = with_app(|a| a.taskbar_created == m && m != 0).unwrap_or(false);
+                if is_taskbar {
+                    with_app(|a| a.add_tray()); // Explorer restarted
+                    0
+                } else {
+                    DefWindowProcW(hwnd, msg, wp, lp)
+                }
             }
-            _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
     }
 }
@@ -2263,6 +2445,8 @@ struct Detail {
     folder: String,
     kind: String,
     size: String,
+    bytes: u64,
+    mtime: u64,
 }
 
 /// Size comes from the index; the type is a registry lookup by extension
@@ -2296,6 +2480,8 @@ fn describe(idx: u32, r: &RowView) -> Detail {
         folder: from_wide(&r.path),
         kind,
         size: if r.dir { String::new() } else { human_bytes(r.bytes) },
+        bytes: r.bytes,
+        mtime: r.mtime,
     }
 }
 
@@ -2384,20 +2570,19 @@ fn paint_header(a: &App, hwnd: HWND) {
 /// reliably), so the orange column titles need our painter there too.
 unsafe extern "system" fn header_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
     unsafe {
-        if let Some(a) = app() {
-            match msg {
-                WM_ERASEBKGND => return 1,
-                WM_PAINT => {
-                    paint_header(a, hwnd);
+        match msg {
+            WM_ERASEBKGND => return 1,
+            WM_PAINT => {
+                if with_app(|a| paint_header(a, hwnd)).is_some() {
                     return 0;
                 }
-                // The stock header only repaints the hot item it tracked itself; with
-                // our own paint a full invalidate on leave avoids a stuck hover.
-                WM_MOUSELEAVE => {
-                    InvalidateRect(hwnd, null(), 0);
-                }
-                _ => {}
             }
+            // The stock header only repaints the hot item it tracked itself; with
+            // our own paint a full invalidate on leave avoids a stuck hover.
+            WM_MOUSELEAVE => {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            _ => {}
         }
         DefSubclassProc(hwnd, msg, wp, lp)
     }
@@ -2406,8 +2591,9 @@ unsafe extern "system" fn header_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 /// ListView subclass: typing-to-search.
 unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
     unsafe {
-        if let Some(a) = app() {
-            if msg == WM_MOUSEMOVE || msg == WM_MOUSELEAVE {
+        if msg == WM_MOUSEMOVE || msg == WM_MOUSELEAVE {
+            let mut suppress = false;
+            with_app(|a| {
                 let mut row = -1;
                 if msg == WM_MOUSEMOVE && a.settings.view == VIEW_DETAILS {
                     let mut ht: LVHITTESTINFO = std::mem::zeroed();
@@ -2432,16 +2618,23 @@ unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 // the list's own capture loop after WM_LBUTTONDOWN.
                 let buttons = 0x1 | 0x2 | 0x10; // MK_LBUTTON | MK_RBUTTON | MK_MBUTTON
                 if msg == WM_MOUSEMOVE && a.settings.view == VIEW_DETAILS && wp & buttons == 0 {
-                    return 0;
+                    suppress = true;
                 }
+            });
+            if suppress {
+                return 0;
             }
-            if msg == WM_CHAR {
-                let c = wp as u32;
-                // Printable characters (and Backspace) typed into the list go to the search box.
-                if (c >= 0x20 && c != 0x7F && GetKeyState(VK_CONTROL as i32) >= 0) || c == 0x08 {
+        }
+        if msg == WM_CHAR {
+            let c = wp as u32;
+            // Printable characters (and Backspace) typed into the list go to the search box.
+            if (c >= 0x20 && c != 0x7F && GetKeyState(VK_CONTROL as i32) >= 0) || c == 0x08 {
+                let handled = with_app(|a| {
                     SetFocus(a.edit);
                     SendMessageW(a.edit, EM_SETSEL, usize::MAX, -1);
                     SendMessageW(a.edit, WM_CHAR, wp, lp);
+                }).is_some();
+                if handled {
                     return 0;
                 }
             }

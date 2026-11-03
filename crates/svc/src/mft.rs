@@ -585,7 +585,7 @@ mod tests {
         b[8..12].copy_from_slice(&(value.len() as u32).to_le_bytes());
         b[12..14].copy_from_slice(&24u16.to_le_bytes());
         b.extend_from_slice(value);
-        while (b.len() + 8) % 8 != 0 {
+        while !(b.len() + 8).is_multiple_of(8) {
             b.push(0);
         }
         b

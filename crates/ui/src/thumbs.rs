@@ -47,6 +47,8 @@ pub struct Done {
     gen: u32,
     pub row: u32,
     pub path: String,
+    pub mtime: u64,
+    pub size: u64,
     thumb: Option<Thumb>,
 }
 
@@ -55,6 +57,8 @@ struct Job {
     size: i32,
     row: u32,
     path: String,
+    mtime: u64,
+    file_size: u64,
 }
 
 #[derive(Default)]
@@ -66,6 +70,8 @@ struct Queue {
 
 struct Entry {
     thumb: Option<Thumb>,
+    mtime: u64,
+    size: u64,
     tick: u64,
 }
 
@@ -132,19 +138,37 @@ impl Thumbs {
         self.cache.get(path).is_some_and(|e| e.thumb.is_some())
     }
 
-    /// Not yet tried (a negative result counts as tried).
-    pub fn wants(&self, path: &str) -> bool {
-        !self.cache.contains_key(path)
+    /// Not yet tried or metadata changed (a negative result counts as tried until invalidated).
+    pub fn wants(&mut self, path: &str, mtime: u64, size: u64) -> bool {
+        if let Some(e) = self.cache.get(path) {
+            if e.mtime == mtime && e.size == size {
+                return false;
+            }
+            if let Some(old) = self.cache.remove(path) {
+                self.forget(&old);
+            }
+        }
+        true
     }
 
-    /// Replace the queue with `rows` (row index, path), highest priority first.
-    pub fn schedule<'a>(&self, rows: impl Iterator<Item = (u32, &'a str)>) {
+    /// Invalidate negative cache entries so failed extractions are retried on refresh.
+    pub fn invalidate_failed(&mut self) {
+        let failed: Vec<String> = self.cache.iter().filter(|(_, e)| e.thumb.is_none()).map(|(k, _)| k.clone()).collect();
+        for k in failed {
+            if let Some(e) = self.cache.remove(&k) {
+                self.forget(&e);
+            }
+        }
+    }
+
+    /// Replace the queue with `rows` (row index, path, mtime, size), highest priority first.
+    pub fn schedule<'a>(&self, rows: impl Iterator<Item = (u32, &'a str, u64, u64)>) {
         let (lock, cv) = &*self.shared;
         let mut q = lock.lock().unwrap();
         q.jobs.clear();
-        for (row, path) in rows {
+        for (row, path, mtime, file_size) in rows {
             if !q.busy.iter().any(|b| b == path) {
-                q.jobs.push_back(Job { gen: self.gen, size: self.size, row, path: path.to_string() });
+                q.jobs.push_back(Job { gen: self.gen, size: self.size, row, path: path.to_string(), mtime, file_size });
             }
         }
         if !q.jobs.is_empty() {
@@ -152,10 +176,10 @@ impl Thumbs {
         }
     }
 
-    /// Take a finished job. Returns true if it produced a bitmap worth repainting for.
-    pub fn accept(&mut self, d: Done) -> bool {
+    /// Take a finished job. Returns None if stale, or Some(repainted) if accepted.
+    pub fn accept(&mut self, d: Done) -> Option<bool> {
         if d.gen != self.gen || self.size == 0 {
-            return false; // `d` drops here, freeing a stale bitmap
+            return None; // `d` drops here, freeing a stale bitmap
         }
         let got = d.thumb.is_some();
         if let Some(t) = &d.thumb {
@@ -165,10 +189,10 @@ impl Thumbs {
         self.tick += 1;
         // A path can come back twice if it was re-queued while in flight; keep the
         // accounting honest by releasing whatever it replaces.
-        if let Some(old) = self.cache.insert(d.path, Entry { thumb: d.thumb, tick: self.tick }) {
+        if let Some(old) = self.cache.insert(d.path, Entry { thumb: d.thumb, mtime: d.mtime, size: d.size, tick: self.tick }) {
             self.forget(&old);
         }
-        got
+        Some(got)
     }
 
     fn forget(&mut self, e: &Entry) {
@@ -240,7 +264,14 @@ fn worker(shared: &(Mutex<Queue>, Condvar), hwnd: isize, msg: u32) {
         };
         let thumb = render(&job.path, job.size);
         lock.lock().unwrap().busy.retain(|b| *b != job.path);
-        let p = Box::into_raw(Box::new(Done { gen: job.gen, row: job.row, path: job.path, thumb }));
+        let p = Box::into_raw(Box::new(Done {
+            gen: job.gen,
+            row: job.row,
+            path: job.path,
+            mtime: job.mtime,
+            size: job.file_size,
+            thumb,
+        }));
         if unsafe { PostMessageW(hwnd as HWND, msg, 0, p as isize) } == 0 {
             drop(unsafe { Box::from_raw(p) });
         }

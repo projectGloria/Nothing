@@ -21,7 +21,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     TPM_RIGHTBUTTON,
 };
 
-use crate::com::{Com, IContextMenuVtbl, IShellFolderVtbl, IID_ICONTEXTMENU, IID_ICONTEXTMENU2, IID_ICONTEXTMENU3, IID_IDATAOBJECT, IID_ISHELLFOLDER};
+use crate::com::{
+    Com, IContextMenuVtbl, IShellFolderVtbl, IShellItemArrayVtbl, BHID_DATAOBJECT, BHID_SFUIOBJECT,
+    IID_ICONTEXTMENU, IID_ICONTEXTMENU2, IID_ICONTEXTMENU3, IID_IDATAOBJECT, IID_ISHELLFOLDER,
+};
 use crate::util::wide;
 
 const CMIC_MASK_UNICODE: u32 = 0x4000;
@@ -45,9 +48,75 @@ fn parent_dir(p: &str) -> &str {
     p.trim_end_matches('\\').rsplit_once('\\').map(|(d, _)| d).unwrap_or("")
 }
 
-/// The IShellFolder owning the items, plus their child-relative PIDLs. Shell UI objects
-/// (menus, data objects) must come from a single folder, so items living elsewhere than
-/// the first one's folder are left out.
+#[link(name = "shell32")]
+extern "system" {
+    fn SHCreateShellItemArrayFromIDLists(
+        cidl: u32,
+        rgpidl: *const *const ITEMIDLIST,
+        ppsiItemArray: *mut *mut c_void,
+    ) -> windows_sys::core::HRESULT;
+}
+
+enum ShellSelection {
+    Array(Com),
+    Single(Items),
+}
+
+fn by_parent(paths: &[String]) -> Vec<Vec<String>> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for p in paths {
+        let dir = parent_dir(p);
+        if let Some(g) = groups.iter_mut().find(|(d, _)| d.eq_ignore_ascii_case(dir)) {
+            g.1.push(p.clone());
+        } else {
+            groups.push((dir.to_string(), vec![p.clone()]));
+        }
+    }
+    groups.into_iter().map(|(_, list)| list).collect()
+}
+
+fn selection(paths: &[String]) -> Option<ShellSelection> {
+    if paths.is_empty() {
+        return None;
+    }
+    let abs: Vec<Pidl> = paths.iter().filter_map(|p| pidl(p)).collect();
+    if abs.is_empty() {
+        return None;
+    }
+    let pidl_ptrs: Vec<*const ITEMIDLIST> = abs.iter().map(|p| p.0 as *const ITEMIDLIST).collect();
+    let mut array_ptr = std::ptr::null_mut();
+    let hr = unsafe {
+        SHCreateShellItemArrayFromIDLists(pidl_ptrs.len() as u32, pidl_ptrs.as_ptr(), &mut array_ptr)
+    };
+    if hr >= 0 && !array_ptr.is_null() {
+        return Some(ShellSelection::Array(Com(array_ptr)));
+    }
+    items(paths).map(ShellSelection::Single)
+}
+
+fn guid_eq(a: &windows_sys::core::GUID, b: &windows_sys::core::GUID) -> bool {
+    a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
+}
+
+fn selection_ui_object(sel: &ShellSelection, hwnd: HWND, iid: &windows_sys::core::GUID) -> Option<Com> {
+    match sel {
+        ShellSelection::Array(com) => {
+            let bhid = if guid_eq(iid, &IID_IDATAOBJECT) {
+                &BHID_DATAOBJECT
+            } else {
+                &BHID_SFUIOBJECT
+            };
+            let mut out = std::ptr::null_mut();
+            let hr = unsafe {
+                (com.vtbl::<IShellItemArrayVtbl>().bind_to_handler)(com.0, std::ptr::null_mut(), bhid, iid, &mut out)
+            };
+            (hr >= 0 && !out.is_null()).then_some(Com(out))
+        }
+        ShellSelection::Single(it) => ui_object(it, hwnd, iid),
+    }
+}
+
+/// The IShellFolder owning the items, plus their child-relative PIDLs.
 struct Items {
     folder: Com,
     _abs: Vec<Pidl>,
@@ -142,8 +211,8 @@ pub const SHELL_LAST: u32 = 0x7FFF;
 /// (id > SHELL_LAST, text; id 0 = separator) inserted right under the default verb.
 /// Shell commands run here; a picked `extra` id is returned for the caller to handle.
 pub fn context_menu(hwnd: HWND, paths: &[String], pt: POINT, extra: &[(u32, &str)]) -> Option<u32> {
-    let it = items(paths)?;
-    let cm = ui_object(&it, hwnd, &IID_ICONTEXTMENU)?;
+    let sel = selection(paths)?;
+    let cm = selection_ui_object(&sel, hwnd, &IID_ICONTEXTMENU)?;
     unsafe {
         let menu = CreatePopupMenu();
         let flags = CMF_NORMAL | if GetKeyState(VK_SHIFT as i32) < 0 { CMF_EXTENDEDVERBS } else { 0 };
@@ -220,36 +289,92 @@ unsafe fn warm() {
 /// Run a canonical verb ("delete", "properties", ...) the way Explorer would, including
 /// its confirmation dialogs and Recycle Bin behaviour.
 pub fn verb(hwnd: HWND, paths: &[String], verb: &str) {
-    let Some(it) = items(paths) else { return };
-    let Some(cm) = ui_object(&it, hwnd, &IID_ICONTEXTMENU) else { return };
-    unsafe {
-        // Several handlers only accept InvokeCommand after QueryContextMenu.
-        let menu = CreatePopupMenu();
-        (cm.vtbl::<IContextMenuVtbl>().query_context_menu)(cm.0, menu, 0, 1, 0x7FFF, CMF_NORMAL);
-        let a: Vec<u8> = verb.bytes().chain(std::iter::once(0)).collect();
-        let w = wide(verb);
-        invoke(&cm, hwnd, a.as_ptr(), w.as_ptr(), POINT { x: 0, y: 0 });
-        DestroyMenu(menu);
+    if let Some(sel) = selection(paths) {
+        if let Some(cm) = selection_ui_object(&sel, hwnd, &IID_ICONTEXTMENU) {
+            unsafe {
+                let menu = CreatePopupMenu();
+                (cm.vtbl::<IContextMenuVtbl>().query_context_menu)(cm.0, menu, 0, 1, 0x7FFF, CMF_NORMAL);
+                let a: Vec<u8> = verb.bytes().chain(std::iter::once(0)).collect();
+                let w = wide(verb);
+                invoke(&cm, hwnd, a.as_ptr(), w.as_ptr(), POINT { x: 0, y: 0 });
+                DestroyMenu(menu);
+                return;
+            }
+        }
+    }
+    // Fallback: explicitly handle every parent group
+    for group in by_parent(paths) {
+        let Some(it) = items(&group) else { continue };
+        let Some(cm) = ui_object(&it, hwnd, &IID_ICONTEXTMENU) else { continue };
+        unsafe {
+            let menu = CreatePopupMenu();
+            (cm.vtbl::<IContextMenuVtbl>().query_context_menu)(cm.0, menu, 0, 1, 0x7FFF, CMF_NORMAL);
+            let a: Vec<u8> = verb.bytes().chain(std::iter::once(0)).collect();
+            let w = wide(verb);
+            invoke(&cm, hwnd, a.as_ptr(), w.as_ptr(), POINT { x: 0, y: 0 });
+            DestroyMenu(menu);
+        }
     }
 }
 
 /// Drag the items out of the list into Explorer, a browser upload box, an editor...
 pub fn drag(hwnd: HWND, paths: &[String]) {
-    let Some(it) = items(paths) else { return };
-    let Some(data) = ui_object(&it, hwnd, &IID_IDATAOBJECT) else { return };
+    let Some(sel) = selection(paths) else { return };
+    let Some(data) = selection_ui_object(&sel, hwnd, &IID_IDATAOBJECT) else { return };
     let mut effect = 0;
     unsafe { SHDoDragDrop(hwnd, data.0, std::ptr::null_mut(), DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK, &mut effect) };
 }
 
+#[repr(C)]
+#[allow(non_snake_case, clippy::upper_case_acronyms)]
+struct DROPFILES {
+    pFiles: u32,
+    pt: POINT,
+    fNC: i32,
+    fWide: i32,
+}
+
 /// Ctrl+C: put the files themselves on the clipboard (paste in Explorer copies them).
 pub fn copy_files(hwnd: HWND, paths: &[String]) {
-    let Some(it) = items(paths) else { return };
-    let Some(data) = ui_object(&it, hwnd, &IID_IDATAOBJECT) else { return };
-    unsafe {
-        if OleSetClipboard(data.0) >= 0 {
-            // Render now so the clipboard survives us exiting.
-            OleFlushClipboard();
+    if paths.is_empty() {
+        return;
+    }
+    if let Some(sel) = selection(paths) {
+        if let Some(data) = selection_ui_object(&sel, hwnd, &IID_IDATAOBJECT) {
+            unsafe {
+                if OleSetClipboard(data.0) >= 0 {
+                    OleFlushClipboard();
+                    return;
+                }
+            }
         }
+    }
+    let mut data: Vec<u16> = Vec::new();
+    for p in paths {
+        data.extend(wide(p));
+    }
+    data.push(0);
+    let df_size = std::mem::size_of::<DROPFILES>();
+    let total = df_size + data.len() * 2;
+    unsafe {
+        if OpenClipboard(hwnd) == 0 {
+            return;
+        }
+        EmptyClipboard();
+        let h = GlobalAlloc(GMEM_MOVEABLE, total);
+        if !h.is_null() {
+            let ptr = GlobalLock(h) as *mut u8;
+            if !ptr.is_null() {
+                let df = DROPFILES { pFiles: df_size as u32, pt: POINT { x: 0, y: 0 }, fNC: 0, fWide: 1 };
+                std::ptr::copy_nonoverlapping(&df as *const _ as *const u8, ptr, df_size);
+                std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, ptr.add(df_size), data.len() * 2);
+                GlobalUnlock(h);
+                if SetClipboardData(15 /* CF_HDROP */, h).is_null() {
+                    GlobalFree(h);
+                }
+            }
+        }
+        CloseClipboard();
     }
 }
 

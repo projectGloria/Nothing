@@ -1,6 +1,7 @@
 //! Service brain: owns the index, boots it (snapshot or MFT scan), keeps it live from the
 //! USN journals, and snapshots it to disk.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, RwLock};
@@ -19,6 +20,7 @@ use crate::{log, mft, usn};
 
 const DRIVE_FIXED: u32 = 3;
 const SAVE_EVERY: Duration = Duration::from_secs(30 * 60);
+const ROOT_REC: u64 = 5;
 
 pub struct Engine {
     pub db: RwLock<Index>,
@@ -28,6 +30,7 @@ pub struct Engine {
     /// Volumes currently being (re)scanned, with progress, for the status line.
     scanning: Mutex<Vec<(u8, u8)>>,
     loading: AtomicBool,
+    workers: Mutex<HashSet<u8>>,
 }
 
 impl Engine {
@@ -40,6 +43,7 @@ impl Engine {
             dirty: AtomicBool::new(false),
             scanning: Mutex::new(Vec::new()),
             loading: AtomicBool::new(true),
+            workers: Mutex::new(HashSet::new()),
         })
     }
 
@@ -100,6 +104,7 @@ impl Engine {
                     }
                     resumed = ix.vols.iter().map(|v| (v.letter, v.serial)).collect();
                     log!("loaded snapshot: {} entries in {} ms", ix.len(), t0.elapsed().as_millis());
+                    ix.version += 1;
                     *self.db.write().unwrap() = ix;
                 }
                 Err(e) => log!("no usable snapshot ({e}), full scan"),
@@ -124,26 +129,28 @@ impl Engine {
 
     fn check_volumes(self: &Arc<Self>) {
         let present = ntfs_volumes();
-        let mut fresh = Vec::new();
+        let mut to_spawn = Vec::new();
         {
             let scanning: Vec<u8> = self.scanning.lock().unwrap().iter().map(|s| s.0).collect();
+            let workers = self.workers.lock().unwrap().clone();
             let mut ix = self.db.write().unwrap();
             for vi in (0..ix.vols.len()).rev() {
                 let l = ix.vols[vi].letter;
-                if !present.iter().any(|p| p.0 == l) && !scanning.contains(&l) {
+                if !present.iter().any(|p| p.0 == l) && !scanning.contains(&l) && !workers.contains(&l) {
                     log!("volume {}: gone, dropping", l as char);
                     ix.remove_volume(vi);
                     self.dirty.store(true, Relaxed);
                 }
             }
             for &(l, serial) in &present {
-                if ix.vol_index(l).is_none() && !scanning.contains(&l) {
-                    fresh.push((l, serial));
+                if !workers.contains(&l) && !scanning.contains(&l) {
+                    let need_scan = ix.vol_index(l).is_none();
+                    to_spawn.push((l, serial, need_scan));
                 }
             }
         }
-        for (l, serial) in fresh {
-            self.spawn_volume(l, serial, true);
+        for (l, serial, scan_first) in to_spawn {
+            self.spawn_volume(l, serial, scan_first);
         }
     }
 
@@ -159,8 +166,12 @@ impl Engine {
         if scan_first {
             self.set_progress(letter, Some(0));
         }
+        self.workers.lock().unwrap().insert(letter);
         let me = self.clone();
-        std::thread::spawn(move || me.run_volume(letter, serial, scan_first));
+        std::thread::spawn(move || {
+            me.clone().run_volume(letter, serial, scan_first);
+            me.workers.lock().unwrap().remove(&letter);
+        });
     }
 
     /// One thread per volume: (re)scan when needed, then tail the journal forever.
@@ -222,9 +233,11 @@ impl Engine {
             }
         };
         let mut pending: Vec<(u32, Change)> = Vec::new();
+        let mut pending_checkpoint: Option<i64> = None;
         loop {
             match tail.read(jid, next, self.stop.0) {
                 Ok((n, mut changes)) => {
+                    let batch_start = next;
                     // Disk-touching metadata lookups happen before taking the write lock,
                     // so searches never wait on I/O.
                     for c in changes.iter_mut() {
@@ -235,7 +248,15 @@ impl Engine {
                     let mut ix = self.db.write().unwrap();
                     let Some(vi) = ix.vol_index(letter) else { return TailEnd::Stop };
                     let changed = apply(&mut ix, vi, changes, &mut pending);
-                    ix.vols[vi].next_usn = n;
+                    if pending.is_empty() {
+                        pending_checkpoint = None;
+                        ix.vols[vi].next_usn = n;
+                    } else {
+                        if pending_checkpoint.is_none() {
+                            pending_checkpoint = Some(batch_start);
+                        }
+                        ix.vols[vi].next_usn = pending_checkpoint.unwrap();
+                    }
                     ix.apply_changes(&changed);
                     if ix.deleted > 200_000 || ix.garbage > 64 << 20 {
                         ix.compact();
@@ -316,10 +337,9 @@ fn flags_of(attrs: u32) -> u8 {
 pub fn apply(ix: &mut Index, vi: usize, changes: Vec<Change>, pending: &mut Vec<(u32, Change)>) -> Vec<u32> {
     let mut changed = Vec::new();
     for c in changes {
-        if let Change::Delete { rec } = c {
-            // A parked create for a file that is already gone must not resurrect it.
-            pending.retain(|(_, p)| rec_of(p) != rec);
-        }
+        let rec = rec_of(&c);
+        // Any newer event for `rec` supersedes older pending updates for the same record.
+        pending.retain(|(_, p)| rec_of(p) != rec);
         if let Err(c) = apply_one(ix, vi, c, &mut changed) {
             pending.push((0, c));
         }
@@ -338,6 +358,9 @@ pub fn apply(ix: &mut Index, vi: usize, changes: Vec<Change>, pending: &mut Vec<
 fn apply_one(ix: &mut Index, vi: usize, c: Change, changed: &mut Vec<u32>) -> Result<(), Change> {
     match c {
         Change::Delete { rec } => {
+            if rec == ROOT_REC {
+                return Ok(());
+            }
             let v = &mut ix.vols[vi];
             let id = v.get(rec);
             let links = v.links.remove(&rec).unwrap_or_default();
@@ -359,7 +382,59 @@ fn apply_one(ix: &mut Index, vi: usize, c: Change, changed: &mut Vec<u32>) -> Re
             }
             let fl = flags_of(attrs);
             let id = ix.vols[vi].get(rec);
-            if id != NONE && ix.is_live(id) {
+
+            // [P1] Protect the volume root from ordinary journal upserts
+            if rec == ROOT_REC || id == ix.vols[vi].root {
+                if id != NONE && ix.is_live(id) {
+                    let i = id as usize;
+                    let mut ch = false;
+                    let root_fl = fl | flag::DIR;
+                    if ix.flags[i] != root_fl {
+                        ix.flags[i] = root_fl;
+                        ch = true;
+                    }
+                    if let Some((_, m)) = meta {
+                        if ix.mtime[i] != m {
+                            ix.mtime[i] = m;
+                            ch = true;
+                        }
+                    }
+                    if ch {
+                        changed.push(id);
+                    }
+                }
+                return Ok(());
+            }
+
+            // [P2] Resolve the affected link: check primary link first, then secondary links in v.links[&rec].
+            let target_id = if id != NONE && ix.is_live(id) && ix.parent[id as usize] == pid && ix.name(id) == name {
+                Some(id)
+            } else if let Some(links) = ix.vols[vi].links.get(&rec) {
+                links.iter().copied().find(|&l| l != NONE && ix.is_live(l) && ix.parent[l as usize] == pid && ix.name(l) == name)
+            } else {
+                None
+            };
+
+            let primary_live = id != NONE && ix.is_live(id);
+            if let Some(tid) = target_id {
+                let i = tid as usize;
+                let mut ch = false;
+                if ix.flags[i] != fl {
+                    ix.flags[i] = fl;
+                    ch = true;
+                }
+                if let Some((s, m)) = meta {
+                    let sz = if fl & flag::DIR != 0 { 0 } else { s };
+                    if ix.size[i] != sz || ix.mtime[i] != m {
+                        ix.size[i] = sz;
+                        ix.mtime[i] = m;
+                        ch = true;
+                    }
+                }
+                if ch {
+                    changed.push(tid);
+                }
+            } else if primary_live {
                 let i = id as usize;
                 let mut ch = false;
                 if ix.name(id) != name {
@@ -375,8 +450,9 @@ fn apply_one(ix: &mut Index, vi: usize, c: Change, changed: &mut Vec<u32>) -> Re
                     ch = true;
                 }
                 if let Some((s, m)) = meta {
-                    if ix.size[i] != s || ix.mtime[i] != m {
-                        ix.size[i] = s;
+                    let sz = if fl & flag::DIR != 0 { 0 } else { s };
+                    if ix.size[i] != sz || ix.mtime[i] != m {
+                        ix.size[i] = sz;
                         ix.mtime[i] = m;
                         ch = true;
                     }
@@ -386,13 +462,44 @@ fn apply_one(ix: &mut Index, vi: usize, c: Change, changed: &mut Vec<u32>) -> Re
                 }
             } else {
                 let (s, m) = meta.unwrap_or((0, 0));
-                let id = ix.push(vi as u8, pid, name, fl, if fl & flag::DIR != 0 { 0 } else { s }, m);
-                ix.vols[vi].set(rec, id);
-                changed.push(id);
+                let sz = if fl & flag::DIR != 0 { 0 } else { s };
+                let new_id = ix.push(vi as u8, pid, name, fl, sz, m);
+                ix.vols[vi].set(rec, new_id);
+                changed.push(new_id);
+            }
+
+            // Propagate shared metadata (size, mtime, flags) to all other links of this record
+            if let Some((s, m)) = meta {
+                let sz = if fl & flag::DIR != 0 { 0 } else { s };
+                if primary_live && target_id != Some(id) {
+                    let i = id as usize;
+                    if ix.size[i] != sz || ix.mtime[i] != m || ix.flags[i] != fl {
+                        ix.size[i] = sz;
+                        ix.mtime[i] = m;
+                        ix.flags[i] = fl;
+                        changed.push(id);
+                    }
+                }
+                if let Some(links) = ix.vols[vi].links.get(&rec) {
+                    for &l in links {
+                        if l != NONE && ix.is_live(l) && Some(l) != target_id {
+                            let li = l as usize;
+                            if ix.size[li] != sz || ix.mtime[li] != m || ix.flags[li] != fl {
+                                ix.size[li] = sz;
+                                ix.mtime[li] = m;
+                                ix.flags[li] = fl;
+                                changed.push(l);
+                            }
+                        }
+                    }
+                }
             }
             Ok(())
         }
         Change::Link { rec, parent, ref name, attrs } => {
+            if rec == ROOT_REC {
+                return Ok(());
+            }
             let pid = ix.vols[vi].get(parent);
             if pid == NONE {
                 return Ok(());
@@ -400,21 +507,27 @@ fn apply_one(ix: &mut Index, vi: usize, c: Change, changed: &mut Vec<u32>) -> Re
             let is_it = |ix: &Index, id: u32| id != NONE && ix.is_live(id) && ix.parent[id as usize] == pid && ix.name(id) == name;
             let primary = ix.vols[vi].get(rec);
             let links = ix.vols[vi].links.get(&rec).cloned().unwrap_or_default();
-            if is_it(ix, primary) {
-                // This name was removed while other links survive: promote one of them.
-                ix.delete(primary);
-                changed.push(primary);
-                let promoted = ix.vols[vi].links.get_mut(&rec).and_then(|l| if l.is_empty() { None } else { Some(l.remove(0)) });
-                ix.vols[vi].set(rec, promoted.unwrap_or(NONE));
-            } else if let Some(pos) = links.iter().position(|&l| is_it(ix, l)) {
-                let l = links[pos];
-                ix.delete(l);
-                changed.push(l);
-                if let Some(v) = ix.vols[vi].links.get_mut(&rec) {
-                    v.retain(|&x| x != l);
-                }
+            let already_indexed = is_it(ix, primary) || links.iter().any(|&l| is_it(ix, l));
+
+            // Check if link exists on disk (for real volumes with a valid serial)
+            let is_real_vol = ix.vols[vi].serial != 0;
+            let link_exists = if is_real_vol {
+                let dir = ix.dir_path(pid);
+                let full_path = if dir.ends_with('\\') { format!("{dir}{name}") } else { format!("{dir}\\{name}") };
+                std::path::Path::new(&full_path).exists()
             } else {
-                let (s, m) = if primary != NONE { (ix.size[primary as usize], ix.mtime[primary as usize]) } else { (0, 0) };
+                !already_indexed
+            };
+
+            if link_exists {
+                if already_indexed {
+                    return Ok(());
+                }
+                let (s, m) = if primary != NONE && ix.is_live(primary) {
+                    (ix.size[primary as usize], ix.mtime[primary as usize])
+                } else {
+                    (0, 0)
+                };
                 let id = ix.push(vi as u8, pid, name, flags_of(attrs), s, m);
                 if primary == NONE || !ix.is_live(primary) {
                     ix.vols[vi].set(rec, id);
@@ -422,6 +535,20 @@ fn apply_one(ix: &mut Index, vi: usize, c: Change, changed: &mut Vec<u32>) -> Re
                     ix.vols[vi].links.entry(rec).or_default().push(id);
                 }
                 changed.push(id);
+            } else if already_indexed {
+                if is_it(ix, primary) {
+                    ix.delete(primary);
+                    changed.push(primary);
+                    let promoted = ix.vols[vi].links.get_mut(&rec).and_then(|l| if l.is_empty() { None } else { Some(l.remove(0)) });
+                    ix.vols[vi].set(rec, promoted.unwrap_or(NONE));
+                } else if let Some(pos) = links.iter().position(|&l| is_it(ix, l)) {
+                    let l = links[pos];
+                    ix.delete(l);
+                    changed.push(l);
+                    if let Some(v) = ix.vols[vi].links.get_mut(&rec) {
+                        v.retain(|&x| x != l);
+                    }
+                }
             }
             Ok(())
         }
@@ -510,5 +637,72 @@ mod tests {
         assert!(!ix.is_live(f));
         assert_eq!(ix.vols[0].get(40), NONE);
         assert_eq!(ix.by_name.len(), 2);
+    }
+
+    #[test]
+    fn root_protected_from_upsert() {
+        let mut ix = fixture();
+        let mut pending = Vec::new();
+        let root = ix.vols[0].root;
+        // NTFS emits an event for root directory with rec=5 and parent=5
+        let ch = apply(&mut ix, 0, vec![up(5, 5, ".", 0x10)], &mut pending);
+        ix.apply_changes(&ch);
+        assert_eq!(ix.name(root), "C:");
+        assert_eq!(ix.parent[root as usize], NONE);
+    }
+
+    #[test]
+    fn hard_link_upsert_preserves_primary_and_propagates_meta() {
+        let mut ix = fixture();
+        let mut pending = Vec::new();
+        // Create primary a.txt
+        let ch = apply(&mut ix, 0, vec![up(40, 5, "a.txt", 0x20)], &mut pending);
+        ix.apply_changes(&ch);
+        let a = ix.vols[0].get(40);
+        assert_eq!(ix.name(a), "a.txt");
+        assert_eq!(ix.size[a as usize], 10);
+
+        // Add hard link b.txt
+        let link = Change::Link { rec: 40, parent: 5, name: "b.txt".into(), attrs: 0x20 };
+        let ch = apply(&mut ix, 0, vec![link], &mut pending);
+        ix.apply_changes(&ch);
+        let b = ix.vols[0].links[&40][0];
+        assert_eq!(ix.name(b), "b.txt");
+        assert_eq!(ix.size[b as usize], 10);
+
+        // Upsert targeting b.txt with new size 999
+        let upsert_b = Change::Upsert { rec: 40, frn: 40, parent: 5, name: "b.txt".into(), attrs: 0x20, fetch: false, meta: Some((999, 50)) };
+        let ch = apply(&mut ix, 0, vec![upsert_b], &mut pending);
+        ix.apply_changes(&ch);
+
+        // a.txt must still be named a.txt (not renamed to b.txt), and its size should be updated to 999
+        assert_eq!(ix.name(a), "a.txt");
+        assert_eq!(ix.size[a as usize], 999);
+        assert_eq!(ix.name(b), "b.txt");
+        assert_eq!(ix.size[b as usize], 999);
+    }
+
+    #[test]
+    fn deferred_events_superseded_by_newer_changes() {
+        let mut ix = fixture();
+        let mut pending = Vec::new();
+        // Child arrives before its folder (parent 50 unknown) with old name
+        let _ch = apply(&mut ix, 0, vec![up(100, 50, "old.txt", 0x20)], &mut pending);
+        assert_eq!(pending.len(), 1);
+
+        // Subsequent successful move/rename to parent 5 with new name
+        let ch = apply(&mut ix, 0, vec![up(100, 5, "new.txt", 0x20)], &mut pending);
+        ix.apply_changes(&ch);
+        let id = ix.vols[0].get(100);
+        assert_eq!(ix.name(id), "new.txt");
+        assert_eq!(ix.parent[id as usize], ix.vols[0].root);
+
+        // Now parent 50 closes and becomes known
+        let ch = apply(&mut ix, 0, vec![up(50, 5, "dir50", 0x10)], &mut pending);
+        ix.apply_changes(&ch);
+
+        // Delayed creation must NOT have restored the old name/parent
+        assert_eq!(ix.name(id), "new.txt");
+        assert_eq!(ix.parent[id as usize], ix.vols[0].root);
     }
 }

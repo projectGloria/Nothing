@@ -17,6 +17,8 @@ pub const IID_ICONTEXTMENU3: GUID = GUID::from_u128(0xBCFCE0A0_EC17_11D0_8D10_00
 pub const IID_IDATAOBJECT: GUID = GUID::from_u128(0x0000010E_0000_0000_C000_000000000046);
 pub const IID_IIMAGELIST: GUID = GUID::from_u128(0x46EB5926_582E_4017_9FDF_E8998DAA0950);
 pub const IID_ISHELLITEMIMAGEFACTORY: GUID = GUID::from_u128(0xBCC18B79_BA16_442F_80C4_8A59C30C463B);
+pub const BHID_SFUIOBJECT: GUID = GUID::from_u128(0x39815401_5E5B_463D_BC64_6532FC4AC88B);
+pub const BHID_DATAOBJECT: GUID = GUID::from_u128(0xB8C0BD9F_ED24_455C_83E6_D5390C4FE8C4);
 
 #[repr(C)]
 pub struct IUnknownVtbl {
@@ -56,6 +58,12 @@ pub struct IContextMenuVtbl {
     pub handle_menu_msg: unsafe extern "system" fn(*mut c_void, u32, WPARAM, LPARAM) -> HRESULT,
     /// IContextMenu3 only.
     pub handle_menu_msg2: unsafe extern "system" fn(*mut c_void, u32, WPARAM, LPARAM, *mut LRESULT) -> HRESULT,
+}
+
+#[repr(C)]
+pub struct IShellItemArrayVtbl {
+    pub base: IUnknownVtbl,
+    pub bind_to_handler: unsafe extern "system" fn(*mut c_void, *mut c_void, *const GUID, *const GUID, *mut *mut c_void) -> HRESULT,
 }
 
 /// Thumbnail (or icon) of a shell item, rendered by the same handlers Explorer uses.

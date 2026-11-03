@@ -398,6 +398,8 @@ struct FactoryVtbl {
 #[repr(C)]
 struct Factory(&'static FactoryVtbl);
 
+static FACTORY_REFS: AtomicU32 = AtomicU32::new(0);
+
 static FACTORY: Factory = Factory(&FactoryVtbl {
     unk: UnknownVtbl { query_interface: factory_qi, add_ref: factory_add_ref, release: factory_release },
     create_instance,
@@ -411,6 +413,7 @@ unsafe extern "system" fn factory_qi(this: Ptr, riid: *const GUID, ppv: *mut Ptr
     let riid = &*riid;
     if guid_eq(riid, &IID_IUNKNOWN) || guid_eq(riid, &IID_ICLASSFACTORY) {
         *ppv = this;
+        factory_add_ref(this);
         S_OK
     } else {
         *ppv = std::ptr::null_mut();
@@ -418,10 +421,10 @@ unsafe extern "system" fn factory_qi(this: Ptr, riid: *const GUID, ppv: *mut Ptr
     }
 }
 unsafe extern "system" fn factory_add_ref(_: Ptr) -> u32 {
-    2
+    FACTORY_REFS.fetch_add(1, Ordering::Relaxed) + 1
 }
 unsafe extern "system" fn factory_release(_: Ptr) -> u32 {
-    1
+    FACTORY_REFS.fetch_sub(1, Ordering::Relaxed) - 1
 }
 
 unsafe extern "system" fn create_instance(_: Ptr, outer: Ptr, riid: *const GUID, ppv: *mut Ptr) -> HRESULT {
@@ -478,7 +481,7 @@ unsafe extern "system" fn DllGetClassObject(rclsid: *const GUID, riid: *const GU
 
 #[no_mangle]
 unsafe extern "system" fn DllCanUnloadNow() -> HRESULT {
-    if OBJECTS.load(Ordering::Relaxed) == 0 && LOCKS.load(Ordering::Relaxed) == 0 {
+    if OBJECTS.load(Ordering::Relaxed) == 0 && LOCKS.load(Ordering::Relaxed) == 0 && FACTORY_REFS.load(Ordering::Relaxed) == 0 {
         S_OK
     } else {
         S_FALSE

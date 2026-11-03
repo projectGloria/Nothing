@@ -53,17 +53,36 @@ fn post(hwnd: isize, msg: u32, ev: Event) {
 struct Conn {
     pipe: Option<File>,
     buf: Vec<u8>,
+    active_query: Option<Request>,
+    reconnected: bool,
 }
 
 impl Conn {
     fn call(&mut self, req: &Request) -> Option<Vec<u8>> {
         // One reconnect attempt: the service may have restarted since the last call.
         for _ in 0..2 {
+            let was_disconnected = self.pipe.is_none();
             if self.pipe.is_none() {
                 self.pipe = OpenOptions::new().read(true).write(true).open(proto::PIPE_NAME).ok();
+                if self.pipe.is_some() && was_disconnected {
+                    self.reconnected = true;
+                    // Restore active query on the new server session
+                    if let Some(ref q) = self.active_query {
+                        if !matches!(req, Request::Query { .. }) {
+                            let p = self.pipe.as_mut().unwrap();
+                            if proto::write_request(p, q).is_err() || proto::read_frame(p, &mut self.buf).is_err() {
+                                self.pipe = None;
+                                continue;
+                            }
+                        }
+                    }
+                }
             }
             let p = self.pipe.as_mut()?;
             if proto::write_request(p, req).is_ok() && proto::read_frame(p, &mut self.buf).is_ok() {
+                if let Request::Query { .. } = req {
+                    self.active_query = Some(req.clone());
+                }
                 return Some(self.buf.clone());
             }
             self.pipe = None;
@@ -80,7 +99,7 @@ impl Conn {
 }
 
 fn worker(rx: Receiver<Cmd>, hwnd: isize, msg: u32) {
-    let mut c = Conn { pipe: None, buf: Vec::new() };
+    let mut c = Conn { pipe: None, buf: Vec::new(), active_query: None, reconnected: false };
     while let Ok(first) = rx.recv() {
         let mut batch = vec![first];
         while let Ok(more) = rx.try_recv() {
@@ -91,6 +110,10 @@ fn worker(rx: Receiver<Cmd>, hwnd: isize, msg: u32) {
         let mut status = false;
         let mut seen_rows = Vec::new();
         for cmd in batch {
+            if c.reconnected {
+                c.reconnected = false;
+                seen_rows.clear();
+            }
             match cmd {
                 Cmd::Query { gen, text, sort, desc, opts, first_row, keep } => {
                     if Some(gen) != latest {
