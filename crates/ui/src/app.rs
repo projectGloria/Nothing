@@ -213,7 +213,6 @@ pub struct App {
     visible: bool,
     exiting: bool,
     last_focus: HWND,
-    taskbar_created: u32,
     hotkey_ok: bool,
     offline_note: String,
     /// Status-bar details for a single selection. Built on selection change, not in
@@ -233,6 +232,8 @@ pub struct App {
     saved_focus: Option<String>,
 }
 
+static TASKBAR_CREATED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 thread_local! {
     static APP: std::cell::Cell<*mut App> = const { std::cell::Cell::new(null_mut()) };
     static APP_BORROWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -243,8 +244,9 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     if p.is_null() {
         return None;
     }
-    let already = APP_BORROWED.with(|b| b.replace(true));
-    assert!(!already, "re-entrant mutable borrow of App attempted!");
+    if APP_BORROWED.with(|b| b.replace(true)) {
+        return None;
+    }
     let res = f(unsafe { &mut *p });
     APP_BORROWED.with(|b| b.set(false));
     Some(res)
@@ -372,6 +374,7 @@ fn build_menu() -> HMENU {
 /// `folder`: from Explorer's "Nothing" verb (`--folder`), search inside it once shown.
 pub fn run(start_hidden: bool, folder: Option<String>) -> i32 {
     unsafe {
+        TASKBAR_CREATED.store(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()), std::sync::atomic::Ordering::Relaxed);
         let hinst = GetModuleHandleW(null());
         let icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES };
         InitCommonControlsEx(&icc);
@@ -496,7 +499,6 @@ pub fn run(start_hidden: bool, folder: Option<String>) -> i32 {
             visible: false,
             exiting: false,
             last_focus: edit,
-            taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
             hotkey_ok: false,
             offline_note: String::new(),
             detail: None,
@@ -529,24 +531,25 @@ pub fn run(start_hidden: bool, folder: Option<String>) -> i32 {
                 SendMessageW(list, LVM_INSERTCOLUMNW, i, &col as *const _ as isize);
             }
             a.apply_dpi(dpi);
-            a.apply_theme();
-            a.apply_view();
-            a.update_menu_checks();
-            a.update_sort_arrow();
-            a.add_tray();
-            a.register_hotkey();
-            a.layout();
-            a.run_query(false);
-            if !start_hidden {
-                a.show();
-                if a.settings.maximized {
-                    ShowWindow(hwnd, SW_MAXIMIZE);
-                }
-            }
-            if let Some(f) = folder {
-                a.open_folder(&f);
-            }
         });
+        with_app(|a| a.apply_theme());
+        with_app(|a| a.apply_view());
+        with_app(|a| a.update_menu_checks());
+        with_app(|a| a.update_sort_arrow());
+        with_app(|a| a.add_tray());
+        with_app(|a| a.register_hotkey());
+        with_app(|a| a.layout());
+        with_app(|a| a.run_query(false));
+        if !start_hidden {
+            with_app(|a| a.show());
+            let max = with_app(|a| a.settings.maximized).unwrap_or(false);
+            if max {
+                ShowWindow(hwnd, SW_MAXIMIZE);
+            }
+        }
+        if let Some(f) = folder {
+            with_app(|a| a.open_folder(&f));
+        }
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -2357,7 +2360,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 0
             }
             WM_GETMINMAXINFO => {
-                let dpi = with_app(|a| a.dpi).unwrap_or(96);
+                let dpi = GetDpiForWindow(hwnd).max(96);
                 let mm = &mut *(lp as *mut MINMAXINFO);
                 mm.ptMinTrackSize = POINT { x: scale(420, dpi), y: scale(240, dpi) };
                 0
@@ -2424,8 +2427,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 0
             }
             m => {
-                let is_taskbar = with_app(|a| a.taskbar_created == m && m != 0).unwrap_or(false);
-                if is_taskbar {
+                let taskbar = TASKBAR_CREATED.load(std::sync::atomic::Ordering::Relaxed);
+                if taskbar != 0 && m == taskbar {
                     with_app(|a| a.add_tray()); // Explorer restarted
                     0
                 } else {
