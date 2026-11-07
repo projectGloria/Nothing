@@ -3,6 +3,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::os::windows::io::FromRawHandle;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,30 +15,41 @@ use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescripto
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 
 use crate::engine::Engine;
 use crate::log;
 use crate::win::{last_error, wide};
 
+extern "system" {
+    fn LocalFree(hmem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+}
+
 /// SYSTEM and Administrators: full. Interactive users: read + write data, but NOT
 /// FILE_CREATE_PIPE_INSTANCE (0x4), so an unprivileged process can't squat the pipe name.
 const SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019b;;;IU)";
+const MAX_CLIENTS: usize = 32;
 
 pub fn serve(engine: Arc<Engine>) {
     let mut psd = std::ptr::null_mut();
-    unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(wide(SDDL).as_ptr(), SDDL_REVISION_1, &mut psd, std::ptr::null_mut()) };
+    let converted = unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(wide(SDDL).as_ptr(), SDDL_REVISION_1, &mut psd, std::ptr::null_mut()) };
+    if converted == 0 || psd.is_null() {
+        log!("failed to set pipe security descriptor: {}", last_error());
+        return;
+    }
     let sa = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: psd, bInheritHandle: 0 };
     let name = wide(proto::PIPE_NAME);
     let mut first = true;
+    static ACTIVE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
+
     loop {
         let h = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
                 PIPE_ACCESS_DUPLEX | if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 },
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                PIPE_UNLIMITED_INSTANCES,
+                MAX_CLIENTS as u32,
                 1 << 16,
                 1 << 16,
                 0,
@@ -47,6 +59,7 @@ pub fn serve(engine: Arc<Engine>) {
         if h == INVALID_HANDLE_VALUE {
             log!("CreateNamedPipe failed: {} (another instance running?)", last_error());
             if first {
+                unsafe { LocalFree(psd as _) };
                 return;
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -58,10 +71,24 @@ pub fn serve(engine: Arc<Engine>) {
             unsafe { CloseHandle(h) };
             continue;
         }
+        if ACTIVE_CLIENTS.load(Relaxed) >= MAX_CLIENTS {
+            unsafe { CloseHandle(h) };
+            continue;
+        }
+        ACTIVE_CLIENTS.fetch_add(1, Relaxed);
         let e = engine.clone();
         // SAFETY: we own `h`; File closes it when the client thread ends.
         let pipe = unsafe { File::from_raw_handle(h as _) };
-        std::thread::spawn(move || client(e, pipe));
+        std::thread::spawn(move || {
+            struct Guard;
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    ACTIVE_CLIENTS.fetch_sub(1, Relaxed);
+                }
+            }
+            let _g = Guard;
+            client(e, pipe);
+        });
     }
 }
 

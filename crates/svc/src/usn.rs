@@ -22,6 +22,9 @@ const MASK48: u64 = 0xFFFF_FFFF_FFFF;
 pub const R_DATA: u32 = 0x1 | 0x2 | 0x4; // overwrite | extend | truncation
 pub const R_CREATE: u32 = 0x100;
 pub const R_DELETE: u32 = 0x200;
+#[allow(dead_code)]
+pub const R_RENAME_OLD: u32 = 0x1000;
+pub const R_RENAME_NEW: u32 = 0x2000;
 pub const R_BASIC_INFO: u32 = 0x8000;
 pub const R_HARD_LINK: u32 = 0x10000;
 
@@ -173,7 +176,7 @@ pub fn decode(mut b: &[u8]) -> Vec<Change> {
         let (rec, parent) = (frn & MASK48, parent & MASK48);
         out.push(if reason & R_DELETE != 0 {
             Change::Delete { rec }
-        } else if reason & R_HARD_LINK != 0 && reason & R_CREATE == 0 {
+        } else if reason & R_HARD_LINK != 0 && reason & (R_CREATE | R_RENAME_NEW) == 0 {
             Change::Link { rec, parent, name, attrs }
         } else {
             Change::Upsert { rec, frn, parent, name, attrs, fetch: reason & (R_DATA | R_CREATE | R_BASIC_INFO) != 0, meta: None }
@@ -242,9 +245,11 @@ mod tests {
         let mut b = rec_v2(0x0003_0000_0000_0064, 5, R_CREATE | 0x8000_0000, 0x20, "new.txt");
         b.extend(rec_v2(0x65, 5, R_DELETE | 0x8000_0000, 0x20, "gone.txt"));
         b.extend(rec_v2(0x66, 7, R_HARD_LINK | 0x8000_0000, 0x20, "link.txt"));
+        b.extend(rec_v2(0x67, 8, R_RENAME_NEW | R_HARD_LINK | 0x8000_0000, 0x20, "moved.txt"));
         let c = decode(&b);
         assert!(matches!(&c[0], Change::Upsert { rec: 100, parent: 5, name, fetch: true, .. } if name == "new.txt"));
         assert!(matches!(c[1], Change::Delete { rec: 0x65 }));
         assert!(matches!(&c[2], Change::Link { rec: 0x66, parent: 7, .. }));
+        assert!(matches!(&c[3], Change::Upsert { rec: 0x67, parent: 8, name, .. } if name == "moved.txt"));
     }
 }

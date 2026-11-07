@@ -81,7 +81,7 @@ impl Icons {
 
     fn own(&mut self, full: &str, fallback: i32) -> i32 {
         if let Some(&i) = self.by_path.get(full) {
-            return i;
+            return if i >= 0 { i } else { fallback };
         }
         if self.pending.len() < 4096 && self.pending.insert(full.to_string()) {
             let _ = self.tx.send(full.to_string());
@@ -94,8 +94,38 @@ impl Icons {
         if self.by_path.len() > 50_000 {
             self.by_path.clear();
         }
-        if idx >= 0 {
-            self.by_path.insert(path, idx);
-        }
+        self.by_path.insert(path, idx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negative_icon_caching_prevents_re_request() {
+        let (tx, rx) = channel::<String>();
+        let mut icons = Icons {
+            image_list: 0,
+            folder: 1,
+            by_ext: HashMap::new(),
+            by_path: HashMap::new(),
+            pending: HashSet::new(),
+            tx,
+        };
+
+        // First call requests the icon
+        let fallback = 42;
+        let res = icons.own("C:\\broken.exe", fallback);
+        assert_eq!(res, fallback);
+        assert_eq!(rx.try_recv().unwrap(), "C:\\broken.exe");
+
+        // Resolve with failure (-1)
+        icons.resolved("C:\\broken.exe".into(), -1);
+
+        // Next call should return fallback without sending request
+        let res2 = icons.own("C:\\broken.exe", fallback);
+        assert_eq!(res2, fallback);
+        assert!(rx.try_recv().is_err());
     }
 }

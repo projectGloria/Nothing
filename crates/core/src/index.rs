@@ -76,7 +76,7 @@ impl Sort {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Index {
     pub parent: Vec<u32>,
     pub name_off: Vec<u32>,
@@ -164,14 +164,14 @@ impl Index {
             end -= 1;
         }
         let name = &name[..end];
-        let off = self.names.len() as u32;
+        let off = u32::try_from(self.names.len()).expect("Index name arena overflow (>4GB)");
         self.names.extend_from_slice(name.as_bytes());
         fold_into(name, &mut self.folded);
         (off, name.len() as u16)
     }
 
     pub fn push(&mut self, vol: u8, parent: u32, name: &str, flags: u8, size: u64, mtime: u64) -> u32 {
-        let id = self.parent.len() as u32;
+        let id = u32::try_from(self.parent.len()).expect("Index entry limit overflow (>4B items)");
         let (off, len) = self.push_name(name);
         self.parent.push(parent);
         self.name_off.push(off);
@@ -419,12 +419,17 @@ impl Index {
     /// Append another index (typically one freshly scanned volume), renumbering its ids.
     /// The caller rebuilds sorts afterwards.
     pub fn append(&mut self, other: Index) {
-        let id_off = self.len() as u32;
-        let name_off = self.names.len() as u32;
-        let vol_off = self.vols.len() as u8;
-        let shift = |p: u32| if p == NONE { NONE } else { p + id_off };
+        let id_off = u32::try_from(self.len()).expect("Index entry limit overflow (>4B items)");
+        let name_off = u32::try_from(self.names.len()).expect("Index name arena overflow (>4GB)");
+        let vol_off = u8::try_from(self.vols.len()).expect("Index volume limit overflow (>255 vols)");
+        let total_len = self.len().checked_add(other.len()).expect("Index entry limit overflow");
+        assert!(total_len <= u32::MAX as usize, "Index entry limit overflow (>4B items)");
+        let total_names = self.names.len().checked_add(other.names.len()).expect("Index name arena overflow");
+        assert!(total_names <= u32::MAX as usize, "Index name arena overflow (>4GB)");
+
+        let shift = |p: u32| if p == NONE { NONE } else { p.checked_add(id_off).expect("Index id overflow") };
         self.parent.extend(other.parent.iter().map(|&p| shift(p)));
-        self.name_off.extend(other.name_off.iter().map(|&o| o + name_off));
+        self.name_off.extend(other.name_off.iter().map(|&o| o.checked_add(name_off).expect("Index name_off overflow")));
         self.name_len.extend_from_slice(&other.name_len);
         self.flags.extend_from_slice(&other.flags);
         self.vol.extend(other.vol.iter().map(|&v| v + vol_off));
@@ -731,5 +736,30 @@ pub(crate) mod tests {
         par_sort_by(&mut v, |a, b| a.cmp(b));
         w.sort();
         assert_eq!(v, w);
+    }
+
+    #[test]
+    fn clone_and_append() {
+        let ix1 = sample();
+        let mut ix2 = ix1.clone();
+        assert_eq!(ix1.len(), ix2.len());
+        assert_eq!(ix1.names, ix2.names);
+
+        let mut other = Index::default();
+        other.vols.push(Volume {
+            letter: b'D',
+            serial: 0x9999,
+            root: 0,
+            frn: vec![NONE],
+            ..Default::default()
+        });
+        other.push(0, NONE, "D:", flag::DIR, 0, 0);
+        other.push(0, 0, "file_on_d.txt", 0, 42, 100);
+
+        ix2.append(other);
+        assert_eq!(ix2.len(), ix1.len() + 2);
+        assert_eq!(ix2.name(ix1.len() as u32), "D:");
+        assert_eq!(ix2.name((ix1.len() + 1) as u32), "file_on_d.txt");
+        assert_eq!(ix2.vols.len(), ix1.vols.len() + 1);
     }
 }

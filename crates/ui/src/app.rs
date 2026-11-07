@@ -230,6 +230,7 @@ pub struct App {
     /// Preserved selected file paths across in-place refreshes.
     saved_selection: HashSet<String>,
     saved_focus: Option<String>,
+    restoring_selection: bool,
 }
 
 static TASKBAR_CREATED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -237,6 +238,11 @@ static TASKBAR_CREATED: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 thread_local! {
     static APP: std::cell::Cell<*mut App> = const { std::cell::Cell::new(null_mut()) };
     static APP_BORROWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static HWND_EDIT: std::cell::Cell<HWND> = const { std::cell::Cell::new(null_mut()) };
+    static HWND_LIST: std::cell::Cell<HWND> = const { std::cell::Cell::new(null_mut()) };
+    static PENDING_QUERY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static PENDING_LAYOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CACHED_THEME: std::cell::Cell<(u32, u32, HBRUSH)> = const { std::cell::Cell::new((0, 0, null_mut())) };
 }
 
 fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
@@ -247,9 +253,26 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     if APP_BORROWED.with(|b| b.replace(true)) {
         return None;
     }
-    let res = f(unsafe { &mut *p });
-    APP_BORROWED.with(|b| b.set(false));
-    Some(res)
+    struct BorrowGuard;
+    impl Drop for BorrowGuard {
+        fn drop(&mut self) {
+            APP_BORROWED.with(|b| b.set(false));
+            let query = PENDING_QUERY.with(|q| q.take());
+            let layout = PENDING_LAYOUT.with(|l| l.replace(false));
+            if query.is_some() || layout {
+                with_app(|a| {
+                    if layout {
+                        a.layout();
+                    }
+                    if let Some(keep) = query {
+                        a.run_query(keep);
+                    }
+                });
+            }
+        }
+    }
+    let _guard = BorrowGuard;
+    Some(f(unsafe { &mut *p }))
 }
 
 pub fn message(title: &str, text: &str, error: bool) {
@@ -468,6 +491,8 @@ pub fn run(start_hidden: bool, folder: Option<String>) -> i32 {
         SetWindowSubclass(list, Some(list_proc), 1, 0);
         SetWindowSubclass(edit, Some(edit_proc), 2, 0);
         SetWindowSubclass(header, Some(header_proc), 3, 0);
+        HWND_EDIT.with(|h| h.set(edit));
+        HWND_LIST.with(|h| h.set(list));
 
         let icons = Icons::new(hwnd, WM_APP_ICON);
         SendMessageW(list, LVM_SETIMAGELIST, LVSIL_SMALL as usize, icons.image_list);
@@ -510,6 +535,7 @@ pub fn run(start_hidden: bool, folder: Option<String>) -> i32 {
             hover_row: -1,
             saved_selection: HashSet::new(),
             saved_focus: None,
+            restoring_selection: false,
         });
         APP.with(|a| a.set(Box::into_raw(boxed)));
         with_app(|a| {
@@ -663,6 +689,7 @@ impl App {
 
     fn store_rows(&mut self, first: u32, rows: Vec<Row>) {
         let n = rows.len() as u32;
+        self.restoring_selection = true;
         for (i, r) in rows.into_iter().enumerate() {
             let idx = first + i as u32;
             let v = self.make_row(r);
@@ -676,6 +703,7 @@ impl App {
             }
             self.rows.insert(idx, v);
         }
+        self.restoring_selection = false;
         // Newly known paths may fall in the thumbnail window.
         self.thumbs.dirty = true;
         // Mark fully covered pages as fetched.
@@ -1021,6 +1049,7 @@ impl App {
         };
         // Assigning drops the old Theme, which frees its brushes (see Drop).
         self.theme = Theme::new(kind);
+        CACHED_THEME.with(|c| c.set((self.theme.fg, self.theme.field, self.theme.br_field)));
         let dark = self.theme.dark;
         // Popup menus, the shell context menu and scrollbars are themed process-wide,
         // not per window: an explicit choice has to force uxtheme's mode, or a "Dark"
@@ -1267,17 +1296,7 @@ impl App {
         let mut result = Vec::new();
         for i in idx {
             if let Some(r) = self.rows.get(&i) {
-                if !self.saved_selection.is_empty() && !self.saved_selection.contains(&r.full) {
-                    let mut desel: LVITEMW = unsafe { std::mem::zeroed() };
-                    desel.stateMask = LVIS_SELECTED;
-                    unsafe { SendMessageW(self.list, LVM_SETITEMSTATE, i as usize, &desel as *const _ as isize) };
-                    continue;
-                }
                 result.push(r.full.clone());
-            } else {
-                let mut desel: LVITEMW = unsafe { std::mem::zeroed() };
-                desel.stateMask = LVIS_SELECTED;
-                unsafe { SendMessageW(self.list, LVM_SETITEMSTATE, i as usize, &desel as *const _ as isize) };
             }
         }
         if result.is_empty() && !self.saved_selection.is_empty() {
@@ -1701,7 +1720,20 @@ impl App {
                     shell::drag(self.hwnd, &p);
                     Some(0)
                 }
-                LVN_ITEMCHANGED | LVN_ODSTATECHANGED => {
+                LVN_ITEMCHANGED => {
+                    let nmlv = &*(lp as *const NMLISTVIEW);
+                    if nmlv.uChanged & LVIF_STATE != 0
+                        && (nmlv.uNewState ^ nmlv.uOldState) & LVIS_SELECTED != 0
+                        && !self.restoring_selection
+                    {
+                        self.saved_selection.clear();
+                        self.saved_focus = None;
+                    }
+                    self.update_detail();
+                    self.invalidate_status();
+                    None
+                }
+                LVN_ODSTATECHANGED => {
                     self.update_detail();
                     self.invalidate_status();
                     None
@@ -2208,7 +2240,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     unsafe {
         match msg {
             WM_SIZE => {
-                with_app(|a| a.layout());
+                if with_app(|a| a.layout()).is_none() {
+                    PENDING_LAYOUT.with(|l| l.set(true));
+                }
                 0
             }
             WM_PAINT => {
@@ -2228,19 +2262,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 0
             }
             WM_CTLCOLOREDIT => {
-                with_app(|a| {
+                let (fg, bg, br) = CACHED_THEME.with(|c| c.get());
+                if !br.is_null() {
                     let hdc = wp as HDC;
-                    SetTextColor(hdc, a.theme.fg);
-                    SetBkColor(hdc, a.theme.field);
-                    a.theme.br_field as LRESULT
-                }).unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp))
+                    SetTextColor(hdc, fg);
+                    SetBkColor(hdc, bg);
+                    br as LRESULT
+                } else {
+                    with_app(|a| {
+                        let hdc = wp as HDC;
+                        SetTextColor(hdc, a.theme.fg);
+                        SetBkColor(hdc, a.theme.field);
+                        a.theme.br_field as LRESULT
+                    }).unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp))
+                }
             }
             WM_COMMAND => {
-                let is_edit = with_app(|a| lp as HWND == a.edit).unwrap_or(false);
+                let is_edit = HWND_EDIT.with(|h| h.get() == lp as HWND);
                 let code = (wp >> 16) as u32;
                 if is_edit {
-                    if code == EN_CHANGE {
-                        with_app(|a| a.run_query(false));
+                    if code == EN_CHANGE && with_app(|a| a.run_query(false)).is_none() {
+                        PENDING_QUERY.with(|q| q.set(Some(false)));
                     }
                     0
                 } else {
@@ -2250,7 +2292,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_NOTIFY => with_app(|a| a.on_notify(lp)).flatten().unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp)),
             WM_CONTEXTMENU => {
-                let is_list = with_app(|a| wp as HWND == a.list).unwrap_or(false);
+                let is_list = HWND_LIST.with(|h| h.get() == wp as HWND);
                 if is_list {
                     let mut pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
                     if lp == -1 {
@@ -2372,8 +2414,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 0
             }
             WM_SETTINGCHANGE => {
-                if lp != 0 && from_wide(std::slice::from_raw_parts(lp as *const u16, 64)).starts_with("ImmersiveColorSet") {
-                    with_app(|a| a.apply_theme());
+                if lp != 0 {
+                    let ptr = lp as *const u16;
+                    let mut len = 0;
+                    while len < 64 && *ptr.add(len) != 0 {
+                        len += 1;
+                    }
+                    if from_wide(std::slice::from_raw_parts(ptr, len)).starts_with("ImmersiveColorSet") {
+                        with_app(|a| a.apply_theme());
+                    }
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }

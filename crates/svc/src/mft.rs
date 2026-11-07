@@ -313,6 +313,9 @@ pub fn scan(letter: u8, serial: u32, progress: &(dyn Fn(u8) + Sync)) -> io::Resu
     let t_open = t0.elapsed();
     let read_ns = AtomicU64::new(0);
 
+    let sector_size = (vd.BytesPerSector as u64).max(512);
+    let align = sector_size.max(rs as u64);
+
     // Plan chunk reads: (disk offset, first record number, byte length).
     let mut plan = Vec::new();
     let mut rec = 0u64;
@@ -322,10 +325,13 @@ pub fn scan(letter: u8, serial: u32, progress: &(dyn Fn(u8) + Sync)) -> io::Resu
             if rec as usize >= total_recs {
                 break 'outer;
             }
-            let n = (len - done).min(CHUNK as u64).min((total_recs as u64 - rec) * rs as u64);
-            // Unbuffered reads need sector-multiple lengths; record size is one.
+            let remaining_recs_bytes = (total_recs as u64 - rec) * rs as u64;
+            let aligned_bytes = remaining_recs_bytes.div_ceil(align) * align;
+            let n = (len - done).min(CHUNK as u64).min(aligned_bytes);
+            // Unbuffered reads need sector-multiple lengths.
             plan.push((off + done, rec, n as usize));
-            rec += n / rs as u64;
+            let recs_in_chunk = (n / rs as u64).min(total_recs as u64 - rec);
+            rec += recs_in_chunk;
             done += n;
         }
     }

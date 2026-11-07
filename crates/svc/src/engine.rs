@@ -286,19 +286,22 @@ impl Engine {
         let path = Self::index_path();
         let _ = std::fs::create_dir_all(path.parent().unwrap());
         for _ in 0..3 {
-            self.db.write().unwrap().compact();
-            let ix = self.db.read().unwrap();
-            if ix.deleted != 0 {
-                continue; // a journal batch slipped in between; compact again
-            }
-            if ix.vols.is_empty() {
-                return;
-            }
+            let snap = {
+                let mut db = self.db.write().unwrap();
+                db.compact();
+                if db.deleted != 0 {
+                    continue; // a journal batch slipped in between; compact again
+                }
+                if db.vols.is_empty() {
+                    return;
+                }
+                db.clone()
+            };
             let t0 = Instant::now();
-            match persist::save(&ix, &path) {
+            match persist::save(&snap, &path) {
                 Ok(()) => {
                     self.dirty.store(false, Relaxed);
-                    log!("saved snapshot: {} entries in {} ms", ix.len(), t0.elapsed().as_millis());
+                    log!("saved snapshot: {} entries in {} ms", snap.len(), t0.elapsed().as_millis());
                 }
                 Err(e) => log!("save failed: {e}"),
             }
@@ -512,7 +515,9 @@ fn apply_one(ix: &mut Index, vi: usize, c: Change, changed: &mut Vec<u32>) -> Re
             // Check if link exists on disk (for real volumes with a valid serial)
             let is_real_vol = ix.vols[vi].serial != 0;
             let link_exists = if is_real_vol {
-                let dir = ix.dir_path(pid);
+                let mut buf = Vec::with_capacity(96);
+                ix.path_into(pid, false, &mut Vec::with_capacity(16), &mut buf);
+                let dir = String::from_utf8(buf).unwrap_or_default();
                 let full_path = if dir.ends_with('\\') { format!("{dir}{name}") } else { format!("{dir}\\{name}") };
                 std::path::Path::new(&full_path).exists()
             } else {
@@ -704,5 +709,49 @@ mod tests {
         // Delayed creation must NOT have restored the old name/parent
         assert_eq!(ix.name(id), "new.txt");
         assert_eq!(ix.parent[id as usize], ix.vols[0].root);
+    }
+
+    #[test]
+    fn hard_link_real_disk_resolution() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("nothing_link_test.txt");
+        let _ = std::fs::write(&test_file, b"test");
+        let file_name = test_file.file_name().unwrap().to_str().unwrap();
+
+        let mut ix = Index::default();
+        let drive = test_file.to_str().unwrap().chars().next().unwrap() as u8;
+        let root = ix.push(0, NONE, &format!("{}:", drive as char), flag::DIR, 0, 0);
+        let mut v = Volume { letter: drive, serial: 0x1234, root, ..Default::default() };
+        v.set(5, root);
+        ix.vols.push(v);
+
+        let mut cur_parent = root;
+        let mut cur_rec = 100u64;
+        for comp in test_file.parent().unwrap().components().skip(1) {
+            let name = comp.as_os_str().to_str().unwrap();
+            let mut pending = Vec::new();
+            let parent_rec = if cur_parent == root { 5 } else { cur_rec - 1 };
+            let ch = apply(&mut ix, 0, vec![up(cur_rec, parent_rec, name, 0x10)], &mut pending);
+            ix.apply_changes(&ch);
+            cur_parent = ix.vols[0].get(cur_rec);
+            cur_rec += 1;
+        }
+
+        let mut pending = Vec::new();
+        let link = Change::Link {
+            rec: 9999,
+            parent: cur_rec - 1,
+            name: file_name.into(),
+            attrs: 0x20,
+        };
+        let ch = apply(&mut ix, 0, vec![link], &mut pending);
+        ix.apply_changes(&ch);
+
+        let id = ix.vols[0].get(9999);
+        assert_ne!(id, NONE);
+        assert_eq!(ix.name(id), file_name);
+        assert_eq!(ix.parent[id as usize], cur_parent);
+
+        let _ = std::fs::remove_file(test_file);
     }
 }
