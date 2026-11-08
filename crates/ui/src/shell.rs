@@ -7,9 +7,11 @@ use std::ffi::c_void;
 
 use windows_sys::Win32::Foundation::{GlobalFree, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::Com::CoTaskMemFree;
-use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+use windows_sys::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+};
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-use windows_sys::Win32::System::Ole::{OleFlushClipboard, OleSetClipboard, CF_UNICODETEXT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
+use windows_sys::Win32::System::Ole::{CF_UNICODETEXT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
 use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows_sys::Win32::UI::Shell::{
@@ -212,7 +214,8 @@ pub const SHELL_LAST: u32 = 0x7FFF;
 /// Shell commands run here; a picked `extra` id is returned for the caller to handle.
 pub fn context_menu(hwnd: HWND, paths: &[String], pt: POINT, extra: &[(u32, &str)]) -> Option<u32> {
     let sel = selection(paths)?;
-    let cm = selection_ui_object(&sel, hwnd, &IID_ICONTEXTMENU)?;
+    let cm = selection_ui_object(&sel, hwnd, &IID_ICONTEXTMENU)
+        .or_else(|| items(paths).and_then(|it| ui_object(&it, hwnd, &IID_ICONTEXTMENU)))?;
     unsafe {
         let menu = CreatePopupMenu();
         let flags = CMF_NORMAL | if GetKeyState(VK_SHIFT as i32) < 0 { CMF_EXTENDEDVERBS } else { 0 };
@@ -334,20 +337,9 @@ struct DROPFILES {
     fWide: i32,
 }
 
-/// Ctrl+C: put the files themselves on the clipboard (paste in Explorer copies them).
-pub fn copy_files(hwnd: HWND, paths: &[String]) {
+fn set_clipboard_files(hwnd: HWND, paths: &[String], cut: bool) {
     if paths.is_empty() {
         return;
-    }
-    if let Some(sel) = selection(paths) {
-        if let Some(data) = selection_ui_object(&sel, hwnd, &IID_IDATAOBJECT) {
-            unsafe {
-                if OleSetClipboard(data.0) >= 0 {
-                    OleFlushClipboard();
-                    return;
-                }
-            }
-        }
     }
     let mut data: Vec<u16> = Vec::new();
     for p in paths {
@@ -374,7 +366,68 @@ pub fn copy_files(hwnd: HWND, paths: &[String]) {
                 }
             }
         }
+        let cf_drop = RegisterClipboardFormatW(wide("Preferred DropEffect").as_ptr());
+        if cf_drop != 0 {
+            let he = GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of::<u32>());
+            if !he.is_null() {
+                let pe = GlobalLock(he) as *mut u32;
+                if !pe.is_null() {
+                    *pe = if cut { DROPEFFECT_MOVE } else { DROPEFFECT_COPY };
+                    GlobalUnlock(he);
+                    if SetClipboardData(cf_drop, he).is_null() {
+                        GlobalFree(he);
+                    }
+                }
+            }
+        }
+        let text = paths.join("\r\n");
+        let w = wide(&text);
+        let ht = GlobalAlloc(GMEM_MOVEABLE, w.len() * 2);
+        if !ht.is_null() {
+            let pt = GlobalLock(ht) as *mut u16;
+            if !pt.is_null() {
+                std::ptr::copy_nonoverlapping(w.as_ptr(), pt, w.len());
+                GlobalUnlock(ht);
+                if SetClipboardData(CF_UNICODETEXT as u32, ht).is_null() {
+                    GlobalFree(ht);
+                }
+            }
+        }
         CloseClipboard();
+    }
+}
+
+/// Ctrl+C: put the files themselves on the clipboard (paste in Explorer copies them).
+pub fn copy_files(hwnd: HWND, paths: &[String]) {
+    set_clipboard_files(hwnd, paths, false);
+}
+
+/// Ctrl+X: put the files on the clipboard marked for move (paste in Explorer moves them).
+pub fn cut_files(hwnd: HWND, paths: &[String]) {
+    set_clipboard_files(hwnd, paths, true);
+}
+
+/// Check if the clipboard currently has a Preferred DropEffect (e.g. DROPEFFECT_MOVE or DROPEFFECT_COPY).
+pub fn check_clipboard_effect() -> Option<u32> {
+    unsafe {
+        let cf = RegisterClipboardFormatW(wide("Preferred DropEffect").as_ptr());
+        if cf == 0 {
+            return None;
+        }
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return None;
+        }
+        let h = GetClipboardData(cf);
+        let effect = if !h.is_null() {
+            let p = GlobalLock(h) as *const u32;
+            let val = if !p.is_null() { *p } else { 0 };
+            GlobalUnlock(h);
+            Some(val)
+        } else {
+            None
+        };
+        CloseClipboard();
+        effect
     }
 }
 
@@ -399,3 +452,20 @@ pub fn copy_text(hwnd: HWND, text: &str) {
         CloseClipboard();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shell_context_menu_query() {
+        unsafe {
+            windows_sys::Win32::System::Ole::OleInitialize(std::ptr::null());
+            let path = "C:\\Windows\\notepad.exe".to_string();
+            let sel = selection(&[path]).expect("selection should succeed");
+            let cm = selection_ui_object(&sel, std::ptr::null_mut(), &IID_ICONTEXTMENU);
+            assert!(cm.is_some(), "IContextMenu must be retrieved");
+        }
+    }
+}
+

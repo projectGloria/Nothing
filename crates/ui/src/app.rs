@@ -47,6 +47,7 @@ const HOTKEY_ID: i32 = 1;
 const ID_OPEN: u16 = 1001;
 const ID_REVEAL: u16 = 1002;
 const ID_EXIT: u16 = 1003;
+const ID_CUT: u16 = 1009;
 const ID_COPY: u16 = 1010;
 const ID_COPY_PATH: u16 = 1011;
 const ID_SELECT_ALL: u16 = 1012;
@@ -231,6 +232,8 @@ pub struct App {
     saved_selection: HashSet<String>,
     saved_focus: Option<String>,
     restoring_selection: bool,
+    cut_paths: HashSet<String>,
+    clip_msg: Option<(String, std::time::Instant)>,
 }
 
 static TASKBAR_CREATED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -360,6 +363,7 @@ fn build_menu() -> HMENU {
         add(bar, ID_OPEN, "&Open\tEnter");
         add(bar, ID_REVEAL, "Open &Path\tCtrl+Enter");
         sep(bar);
+        add(bar, ID_CUT, "Cu&t\tCtrl+X");
         add(bar, ID_COPY, "&Copy\tCtrl+C");
         add(bar, ID_COPY_PATH, "Copy &Full Path\tCtrl+Shift+C");
         add(bar, ID_SELECT_ALL, "Select &All\tCtrl+A");
@@ -536,6 +540,8 @@ pub fn run(start_hidden: bool, folder: Option<String>) -> i32 {
             saved_selection: HashSet::new(),
             saved_focus: None,
             restoring_selection: false,
+            cut_paths: HashSet::new(),
+            clip_msg: None,
         });
         APP.with(|a| a.set(Box::into_raw(boxed)));
         with_app(|a| {
@@ -972,7 +978,12 @@ impl App {
             };
             // Left: orange count, then the selection info in fg.
             let x = run(r.left, &count, self.theme.accent);
-            let x = run(x, &left, self.theme.fg);
+            let mut x = run(x, &left, self.theme.fg);
+            if let Some((msg, time)) = &self.clip_msg {
+                if time.elapsed() < std::time::Duration::from_secs(5) {
+                    x = run(x, &format!("   ·   {}", msg), self.theme.accent);
+                }
+            }
             // Right side gets only what's left, so it can't overprint the count.
             let avail = RECT { left: x + scale(24, self.dpi), ..r };
             if let Some(d) = detail {
@@ -1380,11 +1391,56 @@ impl App {
         if paths.is_empty() {
             return;
         }
-        if as_text {
+        self.cut_paths.clear();
+        let n = paths.len();
+        let msg = if as_text {
             shell::copy_text(self.hwnd, &paths.join("\r\n"));
+            if n == 1 {
+                "Copied path to clipboard".to_string()
+            } else {
+                format!("Copied {} paths to clipboard", thousands(n as u64))
+            }
         } else {
             shell::copy_files(self.hwnd, &paths);
+            if n == 1 {
+                let name = std::path::Path::new(&paths[0])
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&paths[0]);
+                format!("Copied '{}' to clipboard", name)
+            } else {
+                format!("Copied {} items to clipboard", thousands(n as u64))
+            }
+        };
+        self.clip_msg = Some((msg, std::time::Instant::now()));
+        unsafe {
+            SendMessageW(self.list, LVM_REDRAWITEMS, 0, (self.total.saturating_sub(1)) as isize);
         }
+        self.invalidate_status();
+    }
+
+    fn cut_selected(&mut self) {
+        let paths = self.selected_paths(100_000);
+        if paths.is_empty() {
+            return;
+        }
+        self.cut_paths = paths.iter().cloned().collect();
+        shell::cut_files(self.hwnd, &paths);
+        let n = paths.len();
+        let msg = if n == 1 {
+            let name = std::path::Path::new(&paths[0])
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&paths[0]);
+            format!("Cut '{}' to clipboard", name)
+        } else {
+            format!("Cut {} items to clipboard", thousands(n as u64))
+        };
+        self.clip_msg = Some((msg, std::time::Instant::now()));
+        unsafe {
+            SendMessageW(self.list, LVM_REDRAWITEMS, 0, (self.total.saturating_sub(1)) as isize);
+        }
+        self.invalidate_status();
     }
 
     fn select_all_rows(&self) {
@@ -1477,6 +1533,15 @@ impl App {
         let in_edit = focus == self.edit;
         match vk {
             VK_ESCAPE => {
+                if !self.cut_paths.is_empty() {
+                    self.cut_paths.clear();
+                    self.clip_msg = None;
+                    unsafe {
+                        SendMessageW(self.list, LVM_REDRAWITEMS, 0, (self.total.saturating_sub(1)) as isize);
+                    }
+                    self.invalidate_status();
+                    return true;
+                }
                 if !self.search_text().is_empty() {
                     unsafe { SetWindowTextW(self.edit, wide("").as_ptr()) };
                     self.focus_search();
@@ -1534,7 +1599,38 @@ impl App {
             }
             VK_DELETE if in_list => {
                 let p = self.selected_paths(10_000);
-                shell::verb(self.hwnd, &p, "delete");
+                if !p.is_empty() {
+                    let shift = unsafe { GetKeyState(VK_SHIFT as i32) < 0 };
+                    let msg = if p.len() == 1 {
+                        let name = std::path::Path::new(&p[0])
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(&p[0]);
+                        if shift {
+                            format!("Are you sure you want to permanently delete '{}'?", name)
+                        } else {
+                            format!("Are you sure you want to move '{}' to the Recycle Bin?", name)
+                        }
+                    } else {
+                        if shift {
+                            format!("Are you sure you want to permanently delete these {} items?", p.len())
+                        } else {
+                            format!("Are you sure you want to move these {} items to the Recycle Bin?", p.len())
+                        }
+                    };
+                    let title = if shift { "Delete Permanently" } else { "Delete" };
+                    let ret = unsafe {
+                        MessageBoxW(
+                            self.hwnd,
+                            wide(&msg).as_ptr(),
+                            wide(title).as_ptr(),
+                            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1,
+                        )
+                    };
+                    if ret == IDYES {
+                        shell::verb(self.hwnd, &p, "delete");
+                    }
+                }
                 true
             }
             VK_BACK if ctrl && in_edit => {
@@ -1574,6 +1670,10 @@ impl App {
                     self.copy_selected(shift);
                     true
                 }
+                b'X' if in_list => {
+                    self.cut_selected();
+                    true
+                }
                 b'A' => {
                     if in_list {
                         self.select_all_rows();
@@ -1609,6 +1709,7 @@ impl App {
             ID_OPEN => self.open_selected(),
             ID_REVEAL => self.reveal_selected(),
             ID_EXIT => self.exit(),
+            ID_CUT => self.cut_selected(),
             ID_COPY => self.copy_selected(false),
             ID_COPY_PATH => self.copy_selected(true),
             ID_SELECT_ALL => self.select_all_rows(),
@@ -1680,6 +1781,13 @@ impl App {
                         let thumb = self.thumbs.active() && row.is_some_and(|r| !r.dir && self.thumbs.has(&r.full));
                         di.item.iImage = if thumb { I_IMAGENONE } else { row.map(|r| r.icon).unwrap_or(I_IMAGENONE) };
                     }
+                    if di.item.mask & LVIF_STATE != 0 {
+                        let is_cut = row.is_some_and(|r| self.cut_paths.contains(&r.full));
+                        if is_cut {
+                            di.item.state |= LVIS_CUT;
+                            di.item.stateMask |= LVIS_CUT;
+                        }
+                    }
                     Some(0)
                 }
                 LVN_ODCACHEHINT => {
@@ -1728,6 +1836,13 @@ impl App {
                     {
                         self.saved_selection.clear();
                         self.saved_focus = None;
+                        let item = nmlv.iItem;
+                        if item > 0 {
+                            SendMessageW(self.list, LVM_REDRAWITEMS, (item - 1) as usize, (item - 1) as isize);
+                        }
+                        if (item + 1) < self.total as i32 {
+                            SendMessageW(self.list, LVM_REDRAWITEMS, (item + 1) as usize, (item + 1) as isize);
+                        }
                     }
                     self.update_detail();
                     self.invalidate_status();
@@ -1759,18 +1874,26 @@ impl App {
                 let i = cd.nmcd.dwItemSpec;
                 // Ask the list, not uItemState: an owner-data list doesn't reliably set
                 // CDIS_SELECTED there, and the theme decides from the real state anyway.
-                let selected = unsafe { SendMessageW(self.list, LVM_GETITEMSTATE, i, LVIS_SELECTED as isize) } != 0;
+                let state = unsafe { SendMessageW(self.list, LVM_GETITEMSTATE, i, (LVIS_SELECTED | LVIS_DROPHILITED) as isize) } as u32;
+                let selected = (state & (LVIS_SELECTED | LVIS_DROPHILITED)) != 0;
+                let is_cut = self.rows.get(&(i as u32)).is_some_and(|r| self.cut_paths.contains(&r.full));
                 if !selected {
                     // Hover: same trick with a fainter orange instead of the theme's blue
                     // hot box. Our own hover_row, because an owner-data list reports
                     // neither CDIS_HOT nor LVM_GETHOTITEM (that one needs track-select).
-                    if i as i32 != self.hover_row {
+                    let is_hover = i as i32 == self.hover_row;
+                    if !is_hover && !is_cut {
                         return CDRF_DODEFAULT as LRESULT;
                     }
-                    let rc = self.row_rect(i);
-                    unsafe { FillRect(cd.nmcd.hdc, &rc, self.theme.br_hover) };
-                    cd.nmcd.uItemState &= !CDIS_HOT;
-                    cd.clrTextBk = self.theme.hover;
+                    if is_hover {
+                        let rc = self.row_rect(i);
+                        unsafe { FillRect(cd.nmcd.hdc, &rc, self.theme.br_hover) };
+                        cd.clrTextBk = self.theme.hover;
+                    } else {
+                        cd.clrTextBk = self.theme.field;
+                    }
+                    cd.nmcd.uItemState &= !(CDIS_SELECTED | CDIS_FOCUS | CDIS_HOT | 0x0040 | 0x1000);
+                    cd.clrText = if is_cut { self.theme.dim } else { self.theme.fg };
                     return CDRF_NEWFONT as LRESULT;
                 }
                 // Fill the whole row ourselves (clrTextBk alone leaves the icon cell
@@ -1778,15 +1901,51 @@ impl App {
                 // its blue selection / hover box over it. Text is then drawn on clrTextBk.
                 let rc = self.row_rect(i);
                 unsafe { FillRect(cd.nmcd.hdc, &rc, self.theme.br_sel) };
-                cd.nmcd.uItemState &= !(CDIS_SELECTED | CDIS_FOCUS | CDIS_HOT);
-                cd.clrText = self.theme.fg;
+                cd.nmcd.uItemState &= !(CDIS_SELECTED | CDIS_FOCUS | CDIS_HOT | 0x0040 | 0x1000);
+                cd.clrText = if is_cut { self.theme.dim } else { self.theme.fg };
                 cd.clrTextBk = self.theme.sel;
                 (CDRF_NEWFONT | CDRF_NOTIFYPOSTPAINT) as LRESULT
             }
             CDDS_ITEMPOSTPAINT if details => {
                 // Only selected rows asked for post-paint: frame them in accent orange.
-                let rc = self.row_rect(cd.nmcd.dwItemSpec);
-                unsafe { FrameRect(cd.nmcd.hdc, &rc, self.theme.br_accent) };
+                // When contiguous rows are selected, avoid double-width colliding borders
+                // by omitting the shared horizontal divider between adjacent selected items.
+                let i = cd.nmcd.dwItemSpec;
+                let rc = self.row_rect(i);
+                unsafe {
+                    // Left and right borders
+                    let left_rc = RECT { left: rc.left, top: rc.top, right: rc.left + 1, bottom: rc.bottom };
+                    FillRect(cd.nmcd.hdc, &left_rc, self.theme.br_accent);
+
+                    let right_rc = RECT { left: rc.right - 1, top: rc.top, right: rc.right, bottom: rc.bottom };
+                    FillRect(cd.nmcd.hdc, &right_rc, self.theme.br_accent);
+
+                    // Top border: only if item above is not selected
+                    let prev_sel = if i > 0 {
+                        (SendMessageW(self.list, LVM_GETITEMSTATE, i - 1, (LVIS_SELECTED | LVIS_DROPHILITED) as isize) as u32
+                            & (LVIS_SELECTED | LVIS_DROPHILITED))
+                            != 0
+                    } else {
+                        false
+                    };
+                    if !prev_sel {
+                        let top_rc = RECT { left: rc.left, top: rc.top, right: rc.right, bottom: rc.top + 1 };
+                        FillRect(cd.nmcd.hdc, &top_rc, self.theme.br_accent);
+                    }
+
+                    // Bottom border: only if item below is not selected
+                    let next_sel = if (i + 1) < self.total as usize {
+                        (SendMessageW(self.list, LVM_GETITEMSTATE, i + 1, (LVIS_SELECTED | LVIS_DROPHILITED) as isize) as u32
+                            & (LVIS_SELECTED | LVIS_DROPHILITED))
+                            != 0
+                    } else {
+                        false
+                    };
+                    if !next_sel {
+                        let bot_rc = RECT { left: rc.left, top: rc.bottom - 1, right: rc.right, bottom: rc.bottom };
+                        FillRect(cd.nmcd.hdc, &bot_rc, self.theme.br_accent);
+                    }
+                }
                 CDRF_DODEFAULT as LRESULT
             }
             CDDS_ITEMPREPAINT => {
@@ -2160,18 +2319,35 @@ fn run_background_menu(pt: POINT) {
 
 fn run_context_menu(pt: POINT, keyboard: bool) {
     let check = with_app(|a| {
-        let on_item = if keyboard {
-            a.selected_count() > 0
+        let mut target_paths = Vec::new();
+        if keyboard {
+            if a.selected_count() > 0 {
+                target_paths = a.selected_paths(10_000);
+            }
         } else {
             let mut ht: LVHITTESTINFO = unsafe { std::mem::zeroed() };
             ht.pt = pt;
             unsafe {
                 ScreenToClient(a.list, &mut ht.pt);
-                SendMessageW(a.list, LVM_HITTEST, 0, &mut ht as *mut _ as isize) >= 0
+                let hit = SendMessageW(a.list, LVM_HITTEST, 0, &mut ht as *mut _ as isize) as i32;
+                if hit >= 0 {
+                    let is_sel = SendMessageW(a.list, LVM_GETITEMSTATE, hit as usize, LVIS_SELECTED as isize) != 0;
+                    if !is_sel {
+                        // Clear previous selection and select the right-clicked item
+                        let mut desel: LVITEMW = std::mem::zeroed();
+                        desel.stateMask = LVIS_SELECTED;
+                        SendMessageW(a.list, LVM_SETITEMSTATE, usize::MAX, &desel as *const _ as isize);
+
+                        let mut sel: LVITEMW = std::mem::zeroed();
+                        sel.state = LVIS_SELECTED | LVIS_FOCUSED;
+                        sel.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+                        SendMessageW(a.list, LVM_SETITEMSTATE, hit as usize, &sel as *const _ as isize);
+                    }
+                    target_paths = a.selected_paths(10_000);
+                }
             }
-        };
-        let paths = if on_item { a.selected_paths(10_000) } else { Vec::new() };
-        (a.hwnd, paths)
+        }
+        (a.hwnd, target_paths)
     });
     let Some((hwnd, paths)) = check else { return };
     if paths.is_empty() {
@@ -2188,6 +2364,47 @@ fn run_context_menu(pt: POINT, keyboard: bool) {
             with_app(|a| a.copy_selected(true));
         }
         _ => {}
+    }
+    if let Some(effect) = shell::check_clipboard_effect() {
+        if effect == windows_sys::Win32::System::Ole::DROPEFFECT_MOVE {
+            with_app(|a| {
+                a.cut_paths = paths.iter().cloned().collect();
+                let n = paths.len();
+                let msg = if n == 1 {
+                    let name = std::path::Path::new(&paths[0])
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&paths[0]);
+                    format!("Cut '{}' to clipboard", name)
+                } else {
+                    format!("Cut {} items to clipboard", thousands(n as u64))
+                };
+                a.clip_msg = Some((msg, std::time::Instant::now()));
+                unsafe {
+                    SendMessageW(a.list, LVM_REDRAWITEMS, 0, (a.total.saturating_sub(1)) as isize);
+                }
+                a.invalidate_status();
+            });
+        } else if effect == windows_sys::Win32::System::Ole::DROPEFFECT_COPY {
+            with_app(|a| {
+                a.cut_paths.clear();
+                let n = paths.len();
+                let msg = if n == 1 {
+                    let name = std::path::Path::new(&paths[0])
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&paths[0]);
+                    format!("Copied '{}' to clipboard", name)
+                } else {
+                    format!("Copied {} items to clipboard", thousands(n as u64))
+                };
+                a.clip_msg = Some((msg, std::time::Instant::now()));
+                unsafe {
+                    SendMessageW(a.list, LVM_REDRAWITEMS, 0, (a.total.saturating_sub(1)) as isize);
+                }
+                a.invalidate_status();
+            });
+        }
     }
 }
 
@@ -2312,7 +2529,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
             }
             WM_TIMER if wp == TIMER_STATUS => {
-                with_app(|a| a.ipc.send(Cmd::Status));
+                with_app(|a| {
+                    a.ipc.send(Cmd::Status);
+                    if let Some((_, time)) = &a.clip_msg {
+                        if time.elapsed() >= std::time::Duration::from_secs(5) {
+                            a.clip_msg = None;
+                            a.invalidate_status();
+                        }
+                    }
+                });
                 0
             }
             WM_APP_IPC => {
@@ -2640,9 +2865,32 @@ unsafe extern "system" fn header_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     }
 }
 
-/// ListView subclass: typing-to-search.
+/// ListView subclass: typing-to-search and right-click handling.
 unsafe extern "system" fn list_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
     unsafe {
+        if msg == WM_RBUTTONDOWN {
+            let pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
+            with_app(|_a| {
+                let mut ht: LVHITTESTINFO = std::mem::zeroed();
+                ht.pt = pt;
+                let hit = SendMessageW(hwnd, LVM_HITTEST, 0, &mut ht as *mut _ as isize) as i32;
+                if hit >= 0 {
+                    let is_sel = SendMessageW(hwnd, LVM_GETITEMSTATE, hit as usize, LVIS_SELECTED as isize) != 0;
+                    if !is_sel {
+                        // Clear previous selection and select the right-clicked item
+                        let mut desel: LVITEMW = std::mem::zeroed();
+                        desel.stateMask = LVIS_SELECTED;
+                        SendMessageW(hwnd, LVM_SETITEMSTATE, usize::MAX, &desel as *const _ as isize);
+
+                        let mut sel: LVITEMW = std::mem::zeroed();
+                        sel.state = LVIS_SELECTED | LVIS_FOCUSED;
+                        sel.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+                        SendMessageW(hwnd, LVM_SETITEMSTATE, hit as usize, &sel as *const _ as isize);
+                    }
+                    SetFocus(hwnd);
+                }
+            });
+        }
         if msg == WM_MOUSEMOVE || msg == WM_MOUSELEAVE {
             let mut suppress = false;
             with_app(|a| {
