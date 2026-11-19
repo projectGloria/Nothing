@@ -1,0 +1,50 @@
+name: Build installer
+
+# Push a tag like v1.0.0 to build and publish a release, or run it by hand
+# (Actions > Build installer > Run workflow) with the tag to publish under.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc && rustup default stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build installer
+        shell: cmd
+        run: build-installer.cmd
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp target/release/nothing-setup.exe "nothing-setup-$TAG.exe"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "nothing-setup-$TAG.exe" --clobber
+          else
+            gh release create "$TAG" "nothing-setup-$TAG.exe" --title "Nothing $TAG" --generate-notes --target "$GITHUB_SHA"
+          fi
