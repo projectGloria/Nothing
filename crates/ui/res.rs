@@ -116,6 +116,24 @@ fn embed_resources() {
     std::fs::write(&manifest, MANIFEST.replace("{VERSION}", &format!("{}.0", env!("CARGO_PKG_VERSION")))).unwrap();
     let esc = |p: &std::path::Path| p.display().to_string().replace('\\', "\\\\");
     let rc = out.join("app.rc");
-    std::fs::write(&rc, format!("1 ICON \"{}\"\n1 24 \"{}\"\n", esc(&ico), esc(&manifest))).unwrap();
+    // VERSIONINFO: without it Windows names the app after the file ("nothing") in the
+    // taskbar, Task Manager, Alt-Tab and "Open with"; FileDescription gives "Nothing".
+    let v = env!("CARGO_PKG_VERSION").split('.').map(|s| s.parse::<u16>().unwrap_or(0)).chain(std::iter::repeat(0)).take(4).collect::<Vec<_>>();
+    let (vc, vs) = (format!("{},{},{},{}", v[0], v[1], v[2], v[3]), format!("{}.{}.{}.{}", v[0], v[1], v[2], v[3]));
+    // Shared with the installer's build script: name each binary for what it is.
+    let pkg = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
+    let (desc, file) = if pkg == "nothing" { ("Nothing", "nothing.exe".to_string()) } else { ("Nothing Setup", format!("{pkg}.exe")) };
+    let version = format!(
+        "1 VERSIONINFO\nFILEVERSION {vc}\nPRODUCTVERSION {vc}\nFILEOS 0x40004\nFILETYPE 0x1\n\
+         BEGIN\n BLOCK \"StringFileInfo\"\n BEGIN\n  BLOCK \"040904B0\"\n  BEGIN\n\
+         \x20  VALUE \"FileDescription\", \"{desc}\"\n\
+         \x20  VALUE \"ProductName\", \"Nothing\"\n\
+         \x20  VALUE \"InternalName\", \"{desc}\"\n\
+         \x20  VALUE \"OriginalFilename\", \"{file}\"\n\
+         \x20  VALUE \"FileVersion\", \"{vs}\"\n\
+         \x20  VALUE \"ProductVersion\", \"{vs}\"\n\
+         \x20 END\n END\n BLOCK \"VarFileInfo\"\n BEGIN\n  VALUE \"Translation\", 0x409, 1200\n END\nEND\n"
+    );
+    std::fs::write(&rc, format!("1 ICON \"{}\"\n1 24 \"{}\"\n{version}", esc(&ico), esc(&manifest))).unwrap();
     embed_resource::compile(&rc, embed_resource::NONE).manifest_required().unwrap();
 }

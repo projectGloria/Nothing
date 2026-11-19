@@ -246,6 +246,41 @@ thread_local! {
     static PENDING_QUERY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static PENDING_LAYOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CACHED_THEME: std::cell::Cell<(u32, u32, HBRUSH)> = const { std::cell::Cell::new((0, 0, null_mut())) };
+    /// Shell calls that pump messages (ShellExecute, drag and drop, Explorer reveal). Run
+    /// only once the App borrow is released: a paint dispatched inside them would find the
+    /// App borrowed, so the list's custom draw and GETDISPINFO would go unanswered and the
+    /// row would be painted blank in the theme's blue.
+    static DEFERRED: std::cell::RefCell<Vec<Deferred>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// A list notification went unanswered because the App was borrowed: repaint the list
+    /// once it is free, so whatever got painted blank is redrawn properly.
+    static PENDING_LIST_REPAINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+enum Deferred {
+    Open(HWND, Vec<String>),
+    Reveal(String),
+    Drag(HWND, Vec<String>),
+}
+
+fn defer(d: Deferred) {
+    DEFERRED.with(|q| q.borrow_mut().push(d));
+}
+
+fn run_deferred() {
+    while let Some(d) = DEFERRED.with(|q| {
+        let mut q = q.borrow_mut();
+        (!q.is_empty()).then(|| q.remove(0))
+    }) {
+        match d {
+            Deferred::Open(hwnd, paths) => {
+                for p in paths {
+                    shell::open(hwnd, &p);
+                }
+            }
+            Deferred::Reveal(p) => shell::reveal(&p),
+            Deferred::Drag(hwnd, paths) => shell::drag(hwnd, &paths),
+        }
+    }
 }
 
 fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
@@ -271,6 +306,13 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
                         a.run_query(keep);
                     }
                 });
+            }
+            run_deferred();
+            if PENDING_LIST_REPAINT.with(|r| r.replace(false)) {
+                let list = HWND_LIST.with(|h| h.get());
+                if !list.is_null() {
+                    unsafe { InvalidateRect(list, null(), 0) };
+                }
             }
         }
     }
@@ -1364,9 +1406,11 @@ impl App {
         self.rows.get(&(i as u32)).map(|r| r.full.clone())
     }
 
+    // These three are deferred until the App borrow is released (see `DEFERRED`).
     fn open_selected(&mut self) {
-        for p in self.selected_paths(32) {
-            shell::open(self.hwnd, &p);
+        let paths = self.selected_paths(32);
+        if !paths.is_empty() {
+            defer(Deferred::Open(self.hwnd, paths));
         }
     }
 
@@ -1376,13 +1420,13 @@ impl App {
             self.fetch_sync(&[i]);
         }
         if let Some(r) = self.rows.get(&i) {
-            shell::reveal(&r.full);
+            defer(Deferred::Reveal(r.full.clone()));
         }
     }
 
     fn reveal_selected(&mut self) {
         if let Some(p) = self.focused_or_first_selected() {
-            shell::reveal(&p);
+            defer(Deferred::Reveal(p));
         }
     }
 
@@ -1825,7 +1869,7 @@ impl App {
                 }
                 LVN_BEGINDRAG => {
                     let p = self.selected_paths(10_000);
-                    shell::drag(self.hwnd, &p);
+                    defer(Deferred::Drag(self.hwnd, p));
                     Some(0)
                 }
                 LVN_ITEMCHANGED => {
@@ -2507,7 +2551,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     0
                 }
             }
-            WM_NOTIFY => with_app(|a| a.on_notify(lp)).flatten().unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp)),
+            WM_NOTIFY => match with_app(|a| a.on_notify(lp)) {
+                Some(r) => r.unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp)),
+                None => {
+                    // App busy (reentrant): this notification can't be served, so a list
+                    // row may get painted without its text or our selection colours.
+                    let hdr = &*(lp as *const NMHDR);
+                    if HWND_LIST.with(|h| h.get() == hdr.hwndFrom) {
+                        PENDING_LIST_REPAINT.with(|r| r.set(true));
+                    }
+                    DefWindowProcW(hwnd, msg, wp, lp)
+                }
+            },
             WM_CONTEXTMENU => {
                 let is_list = HWND_LIST.with(|h| h.get() == wp as HWND);
                 if is_list {
