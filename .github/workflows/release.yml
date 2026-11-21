@@ -1,6 +1,7 @@
 name: Build installer
 
-# Push a tag like v1.0.0 to build and publish a release, or run it by hand
+# Push a tag like v1.0.0 to build the app, pack it with GloriaSetup and attach
+# Nothing_<version>_x64-setup.exe to that tag's release, or run it by hand
 # (Actions > Build installer > Run workflow) with the tag to publish under.
 on:
   push:
@@ -33,18 +34,33 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
-      - name: Build installer
-        shell: cmd
-        run: build-installer.cmd
+      - name: Build app
+        run: cargo build --release --target x86_64-pc-windows-msvc -p nothing -p nothing-svc -p nothing-shell
 
-      - name: Publish release
+      - name: Collect runtime files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force app-dist | Out-Null
+          foreach ($f in 'nothing.exe', 'nothing-svc.exe', 'nothing_shell.dll') {
+            Copy-Item "target/x86_64-pc-windows-msvc/release/$f" app-dist/
+          }
+
+      - name: Make sure the release exists
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp target/release/nothing-setup.exe "nothing-setup-$TAG.exe"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "nothing-setup-$TAG.exe" --clobber
-          else
-            gh release create "$TAG" "nothing-setup-$TAG.exe" --title "Nothing $TAG" --generate-notes --target "$GITHUB_SHA"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "Nothing $TAG" --generate-notes --target "$GITHUB_SHA"
           fi
+
+      - name: Pack and attach the setup
+        uses: projectGloria/GloriaSetup@v0.1.0
+        with:
+          app-dir: app-dist
+          manifest: gloria.toml
+          version: ${{ startsWith(env.TAG, 'v') && substring(env.TAG, 1, 100) || env.TAG }}
+          release-tag: ${{ env.TAG }}
+          certificate: ${{ secrets.WINDOWS_PFX_BASE64 }}
+          certificate-password: ${{ secrets.WINDOWS_PFX_PASSWORD }}

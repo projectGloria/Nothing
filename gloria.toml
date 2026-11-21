@@ -1,0 +1,9 @@
+id             = "Nothing"
+name           = "Nothing"
+version        = "1.0.0"
+main_exe       = "nothing.exe"
+icon           = "assets/icon-256.png"
+accent         = "#e11d48"
+description    = "NTFS MFT & SIMD instant file search"
+needs_webview2 = false
+data_folders   = ["%APPDATA%\\Nothing"]
