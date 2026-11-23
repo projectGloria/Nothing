@@ -51,6 +51,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --title "Nothing $TAG" --generate-notes --target "$GITHUB_SHA"
           fi
@@ -60,7 +61,9 @@ jobs:
         with:
           app-dir: app-dist
           manifest: gloria.toml
-          version: ${{ startsWith(env.TAG, 'v') && substring(env.TAG, 1, 100) || env.TAG }}
+          version: ${{ env.VERSION }}
           release-tag: ${{ env.TAG }}
+          # A manual run is not a tag run, so the action's default (auto) would skip the upload.
+          upload: "true"
           certificate: ${{ secrets.WINDOWS_PFX_BASE64 }}
           certificate-password: ${{ secrets.WINDOWS_PFX_PASSWORD }}
