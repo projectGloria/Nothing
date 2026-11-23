@@ -3,7 +3,7 @@
 //! Windows 11 only lists `IExplorerCommand` handlers that come from a package in the top
 //! menu; classic `shell\verb` keys go under "Show more options". The sparse package
 //! (package/AppxManifest.xml) points Explorer at this DLL in the install folder; Explorer
-//! loads it in-process and calls `Invoke`, which starts `nothing.exe --folder <dir>`, the
+//! loads it in-process and calls `Invoke`, which starts `Nothing.exe --folder <dir>`, the
 //! same command line the classic verbs use.
 //!
 //! COM by hand: windows-sys has no interface vtables, and a handful of `#[repr(C)]`
@@ -51,7 +51,7 @@ const SIGDN_FILESYSPATH: u32 = 0x8005_8000;
 const ECS_ENABLED: u32 = 0;
 const ECS_HIDDEN: u32 = 2;
 
-/// Our HMODULE, to find nothing.exe next to us (the install folder).
+/// Our HMODULE, to find Nothing.exe next to us (the install folder).
 static MODULE: AtomicIsize = AtomicIsize::new(0);
 /// Live objects + LockServer count: Explorer polls DllCanUnloadNow to drop idle DLLs.
 static OBJECTS: AtomicU32 = AtomicU32::new(0);
@@ -65,7 +65,7 @@ fn exe_path() -> PathBuf {
     let mut buf = [0u16; 1024];
     let n = unsafe { GetModuleFileNameW(MODULE.load(Ordering::Relaxed) as _, buf.as_mut_ptr(), buf.len() as u32) } as usize;
     let dll = PathBuf::from(String::from_utf16_lossy(&buf[..n]));
-    dll.with_file_name("nothing.exe")
+    dll.with_file_name("Nothing.exe")
 }
 
 /// Shell strings are returned in CoTaskMem the caller frees.
@@ -324,7 +324,7 @@ unsafe extern "system" fn get_title(_: Ptr, _: Ptr, out: *mut *mut u16) -> HRESU
 }
 
 unsafe extern "system" fn get_icon(_: Ptr, _: Ptr, out: *mut *mut u16) -> HRESULT {
-    // "file,index": the app icon resource of nothing.exe, same as the classic verb.
+    // "file,index": the app icon resource of Nothing.exe, same as the classic verb.
     co_str(&format!("{},0", exe_path().display()), out)
 }
 
@@ -362,7 +362,7 @@ unsafe extern "system" fn invoke(this: Ptr, array: Ptr, _bind_ctx: Ptr) -> HRESU
     };
     let Some(path) = path else { return E_FAIL };
     // Explorer owns the foreground (the user just clicked); pass that right on, or
-    // nothing.exe (and the running instance it hands off to) only flashes in the taskbar.
+    // Nothing.exe (and the running instance it hands off to) only flashes in the taskbar.
     AllowSetForegroundWindow(ASFW_ANY);
     // std quotes the argument by MSVC rules, so "C:\" arrives intact (no `\"` escape).
     match std::process::Command::new(exe_path()).arg("--folder").arg(&path).spawn() {

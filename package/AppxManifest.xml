@@ -34,7 +34,7 @@
     <rescap:Capability Name="unvirtualizedResources" />
   </Capabilities>
   <Applications>
-    <Application Id="Nothing" Executable="nothing.exe" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
+    <Application Id="Nothing" Executable="Nothing.exe" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
       <!-- AppListEntry="none": the identity package must not show up as a second app in Start. -->
       <uap:VisualElements AppListEntry="none" DisplayName="Nothing" Description="Instant file-name search"
         BackgroundColor="transparent" Square150x150Logo="nothing.png" Square44x44Logo="nothing.png" />

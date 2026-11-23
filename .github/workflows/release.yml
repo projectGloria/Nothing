@@ -42,7 +42,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force app-dist | Out-Null
-          foreach ($f in 'nothing.exe', 'nothing-svc.exe', 'nothing_shell.dll') {
+          foreach ($f in 'Nothing.exe', 'nothing-svc.exe', 'nothing_shell.dll') {
             Copy-Item "target/x86_64-pc-windows-msvc/release/$f" app-dist/
           }
 

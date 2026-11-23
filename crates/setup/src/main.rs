@@ -2,7 +2,7 @@
 //!
 //! It carries both release binaries inside itself (`include_bytes!`), so there is nothing
 //! to unzip and no installer framework to ship. Flow: confirm -> unpack to a temp folder
-//! -> run `nothing.exe --install` elevated (one UAC prompt; that code copies to Program
+//! -> run `Nothing.exe --install` elevated (one UAC prompt; that code copies to Program
 //! Files, registers the service, the logon entry and the Apps & features entry) -> start
 //! the installed UI unelevated.
 //!
@@ -23,7 +23,7 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-static UI: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nothing.exe"));
+static UI: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/Nothing.exe"));
 static SVC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nothing-svc.exe"));
 // Windows 11 compact context menu: the handler DLL, the sparse package that declares it,
 // and the package logo. See package/AppxManifest.xml.
@@ -101,7 +101,7 @@ fn run_elevated(exe: &std::path::Path, args: &str) -> Option<u32> {
 fn main() {
     let silent = std::env::args().skip(1).any(|a| a.eq_ignore_ascii_case("/S") || a == "--silent");
     let dir = install_dir();
-    let upgrading = dir.join("nothing.exe").exists();
+    let upgrading = dir.join("Nothing.exe").exists();
 
     let mut launch = true;
     if !silent {
@@ -123,10 +123,10 @@ fn main() {
         launch = checked;
     }
 
-    // Unpack the payload next to each other (install() picks up its files beside nothing.exe).
+    // Unpack the payload next to each other (install() picks up its files beside Nothing.exe).
     let tmp = std::env::temp_dir().join(format!("nothing-setup-{}", std::process::id()));
     let files: [(&str, &[u8]); 5] =
-        [("nothing.exe", UI), ("nothing-svc.exe", SVC), ("nothing_shell.dll", SHELL_DLL), ("nothing.msix", MSIX), ("nothing.png", LOGO)];
+        [("Nothing.exe", UI), ("nothing-svc.exe", SVC), ("nothing_shell.dll", SHELL_DLL), ("nothing.msix", MSIX), ("nothing.png", LOGO)];
     let unpacked = std::fs::create_dir_all(&tmp).and_then(|_| files.iter().try_for_each(|(name, bytes)| std::fs::write(tmp.join(name), bytes)));
     if let Err(e) = unpacked {
         error(&format!("Could not unpack to {}: {e}", tmp.display()));
@@ -134,7 +134,7 @@ fn main() {
     }
 
     let keep = format!("--install --keep-pid {}", std::process::id());
-    let result = run_elevated(&tmp.join("nothing.exe"), &keep);
+    let result = run_elevated(&tmp.join("Nothing.exe"), &keep);
     let _ = std::fs::remove_dir_all(&tmp);
     match result {
         None => {
@@ -144,7 +144,7 @@ fn main() {
         }
         Some(0) => {
             if launch {
-                let _ = std::process::Command::new(dir.join("nothing.exe")).spawn();
+                let _ = std::process::Command::new(dir.join("Nothing.exe")).spawn();
             }
             if !silent && !launch {
                 dialog("Nothing is installed", "Press Win+Alt+Space anywhere to search.", &[], TDCBF_CLOSE_BUTTON, None);

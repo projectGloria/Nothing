@@ -37,7 +37,7 @@ const VERBS: [(&str, &str); 3] = [
 /// Sparse identity package (package/AppxManifest.xml) that registers nothing_shell.dll as
 /// the compact-menu handler. Name = the manifest's Identity Name.
 const PACKAGE_NAME: &str = "projectGloria.Nothing";
-/// Compact-menu payload. Optional: a dev build run with `nothing.exe --install` has none of
+/// Compact-menu payload. Optional: a dev build run with `Nothing.exe --install` has none of
 /// it and just gets the classic verbs.
 const PACKAGE_FILES: [&str; 3] = ["nothing_shell.dll", "nothing.msix", "nothing.png"];
 
@@ -50,7 +50,7 @@ fn reg_dword(key: &str, name: &str, value: u32) {
     unsafe { RegSetKeyValueW(HKEY_LOCAL_MACHINE, wide(key).as_ptr(), wide(name).as_ptr(), REG_DWORD, &value as *const u32 as *const _, 4) };
 }
 
-/// Close every other running nothing.exe: an older UI sitting in the tray holds its exe
+/// Close every other running Nothing.exe: an older UI sitting in the tray holds its exe
 /// open and would keep running the old version.
 fn stop_other_uis() {
     use std::os::windows::process::CommandExt;
@@ -58,7 +58,7 @@ fn stop_other_uis() {
     let args: Vec<String> = std::env::args().collect();
     let keep = args.iter().position(|a| a == "--keep-pid").and_then(|i| args.get(i + 1)).and_then(|p| p.parse::<u32>().ok());
     let mut cmd = std::process::Command::new("taskkill");
-    cmd.args(["/F", "/IM", "nothing.exe", "/FI", &format!("PID ne {}", std::process::id())]);
+    cmd.args(["/F", "/IM", "Nothing.exe", "/FI", &format!("PID ne {}", std::process::id())]);
     if let Some(k) = keep {
         cmd.args(["/FI", &format!("PID ne {k}")]);
     }
@@ -66,7 +66,7 @@ fn stop_other_uis() {
 }
 
 fn register_uninstaller(dst: &Path) {
-    let exe = dst.join("nothing.exe");
+    let exe = dst.join("Nothing.exe");
     let k = UNINSTALL_KEY;
     reg_sz(k, "DisplayName", "Nothing");
     reg_sz(k, "DisplayVersion", env!("CARGO_PKG_VERSION"));
@@ -77,7 +77,7 @@ fn register_uninstaller(dst: &Path) {
     reg_sz(k, "URLInfoAbout", "https://github.com/projectGloria/Nothing");
     reg_dword(k, "NoModify", 1);
     reg_dword(k, "NoRepair", 1);
-    let bytes: u64 = ["nothing.exe", "nothing-svc.exe", "nothing_shell.dll"].iter().filter_map(|f| std::fs::metadata(dst.join(f)).ok()).map(|m| m.len()).sum();
+    let bytes: u64 = ["Nothing.exe", "nothing-svc.exe", "nothing_shell.dll"].iter().filter_map(|f| std::fs::metadata(dst.join(f)).ok()).map(|m| m.len()).sum();
     reg_dword(k, "EstimatedSize", (bytes / 1024) as u32);
 }
 
@@ -168,7 +168,18 @@ fn copy_into(src_dir: &Path, dst: &Path, name: &str) -> std::io::Result<()> {
     if from == to {
         return Ok(());
     }
-    // A running nothing.exe can't be overwritten but can be renamed out of the way.
+    // Copying over a file keeps its stored name, so an older install's `nothing.exe`
+    // would never become `Nothing.exe`: move a differently cased file out of the way first.
+    let stale_case = std::fs::read_dir(dst).ok().into_iter().flatten().flatten().any(|e| {
+        let n = e.file_name().to_string_lossy().into_owned();
+        n != name && n.eq_ignore_ascii_case(name)
+    });
+    if stale_case {
+        let old = dst.join(format!("{name}.old"));
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(&to, &old)?;
+    }
+    // A running Nothing.exe can't be overwritten but can be renamed out of the way.
     if to.exists() && std::fs::copy(&from, &to).is_err() {
         let old = dst.join(format!("{name}.old"));
         let _ = std::fs::remove_file(&old);
@@ -180,8 +191,8 @@ fn copy_into(src_dir: &Path, dst: &Path, name: &str) -> std::io::Result<()> {
 const SESSION_MANAGER: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager";
 
 /// Undo an earlier uninstall's delete-at-reboot entries for `dir`. Uninstall can't delete
-/// the running nothing.exe (or the folder holding it), so it queues them with MoveFileEx;
-/// installing again before a reboot would otherwise lose the fresh nothing.exe at the next
+/// the running Nothing.exe (or the folder holding it), so it queues them with MoveFileEx;
+/// installing again before a reboot would otherwise lose the fresh Nothing.exe at the next
 /// boot. The queue is a REG_MULTI_SZ of (source, target) pairs, target "" meaning delete;
 /// only those delete pairs under `dir` go, everything else is written back untouched.
 fn cancel_pending_deletes(dir: &Path) {
@@ -253,7 +264,7 @@ fn read_multi_sz(key: &str, value: &str) -> Option<Vec<String>> {
 pub fn install() -> i32 {
     let src = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
     if !src.join("nothing-svc.exe").exists() {
-        crate::app::message("Install", "nothing-svc.exe must sit next to nothing.exe.", true);
+        crate::app::message("Install", "nothing-svc.exe must sit next to Nothing.exe.", true);
         return 2;
     }
     let dst = install_dir();
@@ -274,7 +285,7 @@ pub fn install() -> i32 {
         if !existing.is_null() {
             stop_and_wait(&Sc(existing));
         }
-        for f in ["nothing-svc.exe", "nothing.exe"] {
+        for f in ["nothing-svc.exe", "Nothing.exe"] {
             if let Err(e) = copy_into(&src, &dst, f) {
                 crate::app::message("Install", &format!("Copying {f} failed: {e}"), true);
                 return 5;
@@ -343,15 +354,52 @@ pub fn install() -> i32 {
         ChangeServiceConfig2W(svc.0, SERVICE_CONFIG_FAILURE_ACTIONS, &fa as *const _ as *const _);
         StartServiceW(svc.0, 0, std::ptr::null());
     }
-    reg_sz(RUN_KEY, "Nothing", &format!("\"{}\" --startup", dst.join("nothing.exe").display()));
+    reg_sz(RUN_KEY, "Nothing", &format!("\"{}\" --startup", dst.join("Nothing.exe").display()));
     register_uninstaller(&dst);
     register_verbs(&dst);
     register_package(&dst);
+    if let Err(e) = create_start_menu_shortcut(&dst.join("Nothing.exe")) {
+        crate::app::message("Install", &format!("Could not add Nothing to the Start menu: {e}"), true);
+    }
     0
 }
 
+/// All-users Start menu folder. Windows Search lists apps from the shortcuts in here, so
+/// without one typing "Nothing" after the Windows key finds nothing.
+fn start_menu_shortcut() -> Option<PathBuf> {
+    let pd = std::env::var_os("ProgramData")?;
+    Some(PathBuf::from(pd).join(r"Microsoft\Windows\Start Menu\Programs\Nothing.lnk"))
+}
+
+fn create_start_menu_shortcut(exe: &Path) -> Result<(), String> {
+    use crate::com::{Com, IPersistFileVtbl, IShellLinkWVtbl, CLSID_SHELLLINK, IID_IPERSISTFILE, IID_ISHELLLINKW};
+    use windows_sys::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+
+    let lnk = start_menu_shortcut().ok_or("ProgramData is not set")?;
+    let check = |what: &str, hr: i32| if hr >= 0 { Ok(()) } else { Err(format!("{what} failed (0x{hr:08X})")) };
+    let (exe_w, dir_w, desc_w) = (
+        wide(&exe.display().to_string()),
+        wide(&exe.parent().unwrap_or(exe).display().to_string()),
+        wide("Instant file-name search"),
+    );
+    unsafe {
+        CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        let mut p = std::ptr::null_mut();
+        check("CoCreateInstance(ShellLink)", CoCreateInstance(&CLSID_SHELLLINK, std::ptr::null_mut(), CLSCTX_INPROC_SERVER, &IID_ISHELLLINKW, &mut p))?;
+        let link = Com(p);
+        let v = link.vtbl::<IShellLinkWVtbl>();
+        check("SetPath", (v.set_path)(link.0, exe_w.as_ptr()))?;
+        check("SetWorkingDirectory", (v.set_working_directory)(link.0, dir_w.as_ptr()))?;
+        check("SetDescription", (v.set_description)(link.0, desc_w.as_ptr()))?;
+        check("SetIconLocation", (v.set_icon_location)(link.0, exe_w.as_ptr(), 0))?;
+        let file = link.query(&IID_IPERSISTFILE).ok_or("IPersistFile not supported")?;
+        check("Save", (file.vtbl::<IPersistFileVtbl>().save)(file.0, wide(&lnk.display().to_string()).as_ptr(), 1))?;
+    }
+    Ok(())
+}
+
 fn register_verbs(dst: &Path) {
-    let exe = dst.join("nothing.exe");
+    let exe = dst.join("Nothing.exe");
     for (key, arg) in VERBS {
         reg_sz(key, "", "Nothing");
         reg_sz(key, "Icon", &format!("\"{}\",0", exe.display()));
@@ -433,12 +481,15 @@ pub fn uninstall() -> i32 {
             RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(key).as_ptr());
         }
     }
+    if let Some(lnk) = start_menu_shortcut() {
+        let _ = std::fs::remove_file(lnk);
+    }
     if let Some(pd) = std::env::var_os("ProgramData") {
         let _ = std::fs::remove_dir_all(PathBuf::from(pd).join("Nothing"));
     }
     let dir = install_dir();
     // Explorer may still have nothing_shell.dll loaded: that one usually goes at reboot.
-    let files = ["nothing-svc.exe", "nothing.exe", "nothing_shell.dll", "nothing.msix", "nothing.png"];
+    let files = ["nothing-svc.exe", "Nothing.exe", "nothing_shell.dll", "nothing.msix", "nothing.png"];
     for f in files.iter().flat_map(|f| [f.to_string(), format!("{f}.old")]) {
         let p = dir.join(f);
         if p.exists() && std::fs::remove_file(&p).is_err() {
@@ -464,7 +515,7 @@ mod tests {
     fn pending_deletes_only_ours_go() {
         let dir = Path::new(r"C:\Program Files\Nothing");
         // As read from this machine after an uninstall, plus a stray terminator element.
-        let list = strs(&[r"*1\??\C:\Program Files\Nothing\nothing.exe", "", r"*1\??\C:\Program Files\Nothing", "", ""]);
+        let list = strs(&[r"*1\??\C:\Program Files\Nothing\Nothing.exe", "", r"*1\??\C:\Program Files\Nothing", "", ""]);
         assert_eq!(without_deletes_under(&list, dir), Some(vec![]));
 
         let list = strs(&[

@@ -4,7 +4,7 @@
 
 include!("../ui/res.rs");
 
-const PAYLOAD: [&str; 3] = ["nothing.exe", "nothing-svc.exe", "nothing_shell.dll"];
+const PAYLOAD: [&str; 3] = ["Nothing.exe", "nothing-svc.exe", "nothing_shell.dll"];
 
 /// Publisher of an unsigned package. Windows 11 registers a package without a signature
 /// only if its Publisher carries this OID (so it can never collide with a signed identity)

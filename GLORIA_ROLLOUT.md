@@ -11,9 +11,9 @@ Review these choices, which I made on my own because I could not ask:
    Program Files, registered the `Nothing Index` service (LocalSystem, needed for the raw MFT and USN journal),
    a logon `Run` entry, Explorer context-menu verbs and the sparse MSIX package. GloriaSetup is per-user and does
    none of that. The new setup only copies the files, so the search service will not exist until the app or setup
-   gains a way to register it (for example `nothing.exe --install` run elevated on first launch). Decide before
+   gains a way to register it (for example `Nothing.exe --install` run elevated on first launch). Decide before
    you tag a release that replaces the old installer.
-2. **Packed files:** `nothing.exe`, `nothing-svc.exe` and `nothing_shell.dll`. `nothing.msix` (the Windows 11 compact
+2. **Packed files:** `Nothing.exe`, `nothing-svc.exe` and `nothing_shell.dll`. `nothing.msix` (the Windows 11 compact
    context-menu package) is only produced inside `crates/setup/build.rs`, so it is not in the setup.
 3. **Old installer left in place.** `crates/setup` and `build-installer.cmd` still exist, but the workflow no longer builds
    or publishes `nothing-setup-<tag>.exe`.

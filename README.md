@@ -66,7 +66,7 @@ Measured on a standard consumer PC (*Windows 11, Crucial P3 NVMe SSD, 16 threads
 | **Broad & Path Queries** | **6–9 ms** | Full path traversals (`a`, `users\nihil\desktop`) with bitmask memoization |
 | **Live Journal Delta** | **< 1 s** | Kernel-level event tailing for create, rename, delete, and resize |
 | **Memory Footprint** | **~96 B / file** | ~100 MB RAM for 1.1 million indexed records (Struct-of-Arrays arena) |
-| **Binary Footprint** | **< 1.7 MB** | Self-contained static MSVC binaries (`nothing.exe` 650 KB, `nothing-svc.exe` 540 KB) |
+| **Binary Footprint** | **< 1.7 MB** | Self-contained static MSVC binaries (`Nothing.exe` 650 KB, `nothing-svc.exe` 540 KB) |
 
 ---
 
@@ -198,9 +198,9 @@ nothing-setup.exe /S
 ```
 
 The installer automatically:
-1. Copies `nothing.exe` and `nothing-svc.exe` into `C:\Program Files\Nothing`.
+1. Copies `Nothing.exe` and `nothing-svc.exe` into `C:\Program Files\Nothing`.
 2. Registers and starts the **Nothing Index** Windows Service (`LocalSystem`, auto-start, auto-restart on failure).
-3. Adds `nothing.exe --startup` to user startup (running quietly in the notification tray).
+3. Adds `Nothing.exe --startup` to user startup (running quietly in the notification tray).
 4. Registers Nothing in **Windows Settings ▸ Apps ▸ Installed apps** with clean uninstall support.
 
 ### Manual & Portable Usage
@@ -208,10 +208,10 @@ The installer automatically:
 You can also run Nothing portably without the setup wrapper:
 ```powershell
 # Install/register the indexing service
-nothing.exe --install
+Nothing.exe --install
 
 # Uninstall and deregister the service
-nothing.exe --uninstall
+Nothing.exe --uninstall
 ```
 
 - Press <kbd>Win</kbd> + <kbd>Alt</kbd> + <kbd>Space</kbd> anywhere to summon the window.
@@ -232,7 +232,7 @@ nothing.exe --uninstall
 crates/
 ├── core/   # Indexing engine, SIMD search, snapshot format, pipe protocol (pure Rust, unit tested)
 ├── svc/    # nothing-svc.exe: MFT reader, USN journal tailer, service host, named-pipe server
-├── ui/       # nothing.exe: native Win32 window, virtual list, dark theme, Explorer shell, tray hotkey
+├── ui/       # Nothing.exe: native Win32 window, virtual list, dark theme, Explorer shell, tray hotkey
 ├── shellext/ # nothing_shell.dll: IExplorerCommand handler for Windows 11's compact right-click menu
 └── setup/    # nothing-setup.exe: single-binary self-extracting installer and uninstaller
 package/

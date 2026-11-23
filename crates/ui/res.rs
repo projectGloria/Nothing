@@ -122,7 +122,7 @@ fn embed_resources() {
     let (vc, vs) = (format!("{},{},{},{}", v[0], v[1], v[2], v[3]), format!("{}.{}.{}.{}", v[0], v[1], v[2], v[3]));
     // Shared with the installer's build script: name each binary for what it is.
     let pkg = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
-    let (desc, file) = if pkg == "nothing" { ("Nothing", "nothing.exe".to_string()) } else { ("Nothing Setup", format!("{pkg}.exe")) };
+    let (desc, file) = if pkg == "nothing" { ("Nothing", "Nothing.exe".to_string()) } else { ("Nothing Setup", format!("{pkg}.exe")) };
     let version = format!(
         "1 VERSIONINFO\nFILEVERSION {vc}\nPRODUCTVERSION {vc}\nFILEOS 0x40004\nFILETYPE 0x1\n\
          BEGIN\n BLOCK \"StringFileInfo\"\n BEGIN\n  BLOCK \"040904B0\"\n  BEGIN\n\

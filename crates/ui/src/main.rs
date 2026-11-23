@@ -1,10 +1,10 @@
-//! nothing.exe — the search window.
+//! Nothing.exe — the search window.
 //!
-//!   nothing.exe              open (or bring the running instance to front)
-//!   nothing.exe --startup    start hidden in the tray (used by the logon Run entry)
-//!   nothing.exe --folder D   search inside folder D (Explorer's "Nothing" verb)
-//!   nothing.exe --install    install/repair the indexing service (asks for elevation)
-//!   nothing.exe --uninstall  remove it
+//!   Nothing.exe              open (or bring the running instance to front)
+//!   Nothing.exe --startup    start hidden in the tray (used by the logon Run entry)
+//!   Nothing.exe --folder D   search inside folder D (Explorer's "Nothing" verb)
+//!   Nothing.exe --install    install/repair the indexing service (asks for elevation)
+//!   Nothing.exe --uninstall  remove it
 
 #![windows_subsystem = "windows"]
 
@@ -52,7 +52,7 @@ fn main() {
             // Re-launch elevated, then hand over to the installed (unelevated) UI.
             match install::elevate_and_wait(if uninstall { "--uninstall" } else { "--install" }) {
                 Some(0) if !uninstall => {
-                    let _ = std::process::Command::new(install::install_dir().join("nothing.exe")).spawn();
+                    let _ = std::process::Command::new(install::install_dir().join("Nothing.exe")).spawn();
                     0
                 }
                 Some(0) => {

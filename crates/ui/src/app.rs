@@ -1547,7 +1547,7 @@ impl App {
                     message("Nothing", "Uninstalled. The index service is removed; files are deleted at next reboot if in use.", false);
                     self.exit();
                 } else {
-                    let installed = install::install_dir().join("nothing.exe");
+                    let installed = install::install_dir().join("Nothing.exe");
                     let here = std::env::current_exe().ok();
                     if here.as_deref() != Some(installed.as_path()) {
                         // Hand over to the installed copy (unelevated, like this one).
@@ -2631,7 +2631,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 with_app(|a| a.show());
                 0
             }
-            // A second nothing.exe launched by the folder verb hands its folder over.
+            // A second Nothing.exe launched by the folder verb hands its folder over.
             WM_COPYDATA => {
                 let cds = &*(lp as *const windows_sys::Win32::System::DataExchange::COPYDATASTRUCT);
                 if cds.dwData == COPYDATA_FOLDER && !cds.lpData.is_null() {

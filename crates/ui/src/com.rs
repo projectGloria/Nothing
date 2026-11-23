@@ -74,6 +74,43 @@ pub struct IShellItemImageFactoryVtbl {
     pub get_image: unsafe extern "system" fn(*mut c_void, SIZE, i32, *mut HBITMAP) -> HRESULT,
 }
 
+pub const CLSID_SHELLLINK: GUID = GUID::from_u128(0x00021401_0000_0000_C000_000000000046);
+pub const IID_ISHELLLINKW: GUID = GUID::from_u128(0x000214F9_0000_0000_C000_000000000046);
+pub const IID_IPERSISTFILE: GUID = GUID::from_u128(0x0000010B_0000_0000_C000_000000000046);
+
+/// Shortcut (.lnk) writer, used by the installer for the Start menu entry.
+#[repr(C)]
+pub struct IShellLinkWVtbl {
+    pub base: IUnknownVtbl,
+    _get_path: usize,
+    _get_id_list: usize,
+    _set_id_list: usize,
+    _get_description: usize,
+    pub set_description: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
+    _get_working_directory: usize,
+    pub set_working_directory: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
+    _get_arguments: usize,
+    _set_arguments: usize,
+    _get_hotkey: usize,
+    _set_hotkey: usize,
+    _get_show_cmd: usize,
+    _set_show_cmd: usize,
+    _get_icon_location: usize,
+    pub set_icon_location: unsafe extern "system" fn(*mut c_void, *const u16, i32) -> HRESULT,
+    _set_relative_path: usize,
+    _resolve: usize,
+    pub set_path: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
+}
+
+#[repr(C)]
+pub struct IPersistFileVtbl {
+    pub base: IUnknownVtbl,
+    _get_class_id: usize,
+    _is_dirty: usize,
+    _load: usize,
+    pub save: unsafe extern "system" fn(*mut c_void, *const u16, i32) -> HRESULT,
+}
+
 /// Owned COM pointer, released on drop.
 pub struct Com(pub *mut c_void);
 
