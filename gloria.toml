@@ -1,6 +1,6 @@
 id             = "Nothing"
 name           = "Nothing"
-version        = "1.0.2"
+version        = "1.0.3"
 main_exe       = "Nothing.exe"
 icon           = "assets/icon-256.png"
 accent         = "#e11d48"

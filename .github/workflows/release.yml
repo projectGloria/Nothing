@@ -1,32 +1,96 @@
-name: Build installer
+name: Release
 
-# Push a tag like v1.0.0 to build the app, pack it with GloriaSetup and attach
-# Nothing_<version>_x64-setup.exe to that tag's release, or run it by hand
-# (Actions > Build installer > Run workflow) with the tag to publish under.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Release tag (e.g. v1.0.0)"
-        required: true
+      dry_run:
+        description: "Build and verify installer without publishing a GitHub Release"
+        type: boolean
+        default: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check version change
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GLORIA_VER=$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' gloria.toml | head -n 1)
+          CARGO_VER=$(awk '
+            /^\[workspace\.package\]/ { in_sec=1; next }
+            /^\[/ { in_sec=0 }
+            in_sec && /^version[[:space:]]*=/ {
+              gsub(/.*=[[:space:]]*"|".*/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)
+
+          if [[ -z "$GLORIA_VER" || -z "$CARGO_VER" ]]; then
+            echo "::error::Failed to read version from gloria.toml ('$GLORIA_VER') or Cargo.toml ('$CARGO_VER')"
+            exit 1
+          fi
+
+          if [[ "$GLORIA_VER" != "$CARGO_VER" ]]; then
+            echo "::error::Version mismatch: gloria.toml ($GLORIA_VER) != Cargo.toml ($CARGO_VER)"
+            exit 1
+          fi
+
+          echo "version=$GLORIA_VER" >> "$GITHUB_OUTPUT"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BEFORE="${{ github.event.before }}"
+          PREV_VER=""
+          if [[ -n "$BEFORE" && "$BEFORE" != "0000000000000000000000000000000000000000" ]]; then
+            PREV_VER=$(git show "${BEFORE}:gloria.toml" 2>/dev/null | sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' | head -n 1 || true)
+          fi
+
+          if [[ "$GLORIA_VER" != "$PREV_VER" ]]; then
+            echo "Version changed: '${PREV_VER:-<none>}' -> '$GLORIA_VER'"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version unchanged ($GLORIA_VER); skipping build."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     runs-on: windows-latest
-    env:
-      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    needs: version
+    if: needs.version.outputs.build == 'true'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
 
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc && rustup default stable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
+          rustup default stable
 
-      - uses: actions/cache@v6
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -34,10 +98,19 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
-      - name: Build app
-        run: cargo build --release --target x86_64-pc-windows-msvc -p nothing -p nothing-svc -p nothing-shell
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo test --locked
 
-      - name: Collect runtime files
+      - name: Build release binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release --locked --target x86_64-pc-windows-msvc -p nothing -p nothing-svc -p nothing-shell
+
+      - name: Stage runtime files
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -46,24 +119,78 @@ jobs:
             Copy-Item "target/x86_64-pc-windows-msvc/release/$f" app-dist/
           }
 
-      - name: Make sure the release exists
+      - name: Pack installer with GloriaSetup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npx --yes gloria-setup@0.2.4 --app app-dist --manifest gloria.toml --version ${{ needs.version.outputs.version }} --out dist
+
+      - name: Verify installer dry-run
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = "dist\Nothing_${{ needs.version.outputs.version }}_x64-setup.exe"
+          if (-not (Test-Path $setup)) {
+            throw "Expected installer not found: $setup"
+          }
+          $proc = Start-Process -FilePath $setup -ArgumentList '/S --dry-run' -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            throw "GloriaSetup dry-run failed with exit code $($proc.ExitCode)"
+          }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nothing-installer
+          path: dist/Nothing_${{ needs.version.outputs.version }}_x64-setup.exe
+          compression-level: 0
+          if-no-files-found: error
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [version, build]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || !inputs.dry_run)
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nothing-installer
+          path: release-assets
+
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum *_x64-setup.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
-          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "Nothing $TAG" --generate-notes --target "$GITHUB_SHA"
+          set -euo pipefail
+          TAG="v${VERSION}"
+          SETUP="Nothing_${VERSION}_x64-setup.exe"
+          PRERELEASE_FLAG=""
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE_FLAG="--prerelease"
           fi
 
-      - name: Pack and attach the setup
-        uses: projectGloria/GloriaSetup@v0.1.0
-        with:
-          app-dir: app-dist
-          manifest: gloria.toml
-          version: ${{ env.VERSION }}
-          release-tag: ${{ env.TAG }}
-          # A manual run is not a tag run, so the action's default (auto) would skip the upload.
-          upload: "true"
-          certificate: ${{ secrets.WINDOWS_PFX_BASE64 }}
-          certificate-password: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+          gh release create "$TAG" \
+            "release-assets/${SETUP}" \
+            "release-assets/SHA256SUMS.txt" \
+            --draft \
+            $PRERELEASE_FLAG \
+            --title "Nothing ${TAG}" \
+            --generate-notes \
+            --target "$GITHUB_SHA"
+
+          VERIFY_DIR=$(mktemp -d)
+          gh release download "$TAG" --dir "$VERIFY_DIR" --pattern "$SETUP" --pattern "SHA256SUMS.txt"
+          (cd "$VERIFY_DIR" && sha256sum --check SHA256SUMS.txt)
+          rm -rf "$VERIFY_DIR"
+
+          gh release edit "$TAG" --draft=false
